@@ -25,16 +25,6 @@ struct EventRow {
     after: Option<Vec<Value>>,
 }
 
-// #[derive(Debug, Serialize)]
-// struct Debezium {
-//     op: &str,
-//     schema: HashMap<_, _>,
-//     payload: {
-//         before: Option<Vec<Value>>,
-//         after: Option<Vec<Value>>,
-//     },
-// }
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // let mut pg = Client::connect("host=localhost user=postgres port=4566", NoTls).unwrap();
@@ -45,7 +35,6 @@ async fn main() -> Result<()> {
             BinlogRequest::new(1)
             .with_pos(pos)
     )?;
-    let mut tmes = HashMap::new();
     let mut events: Vec<RowsEventData> = vec!();
 
     let pubsub = Client::new(config).await?;
@@ -56,50 +45,39 @@ async fn main() -> Result<()> {
     while let Some(Ok(event)) = binlog_stream.next() {
         if let Some(e) = event.read_data()? {
             match e {
-                EventData::RowsEvent(ee) => {
-                    match ee {
-                        RowsEventData::WriteRowsEvent(_) => {
-                            events.push(ee.into_owned());
-                        },
-                        RowsEventData::UpdateRowsEvent(_) => {
-                            events.push(ee.into_owned());
-                        },
+                EventData::RowsEvent(rowsEvent) => {
+                    let tme = &binlog_stream.get_tme(rowsEvent.table_id()).unwrap();
+                    match rowsEvent {
+                        RowsEventData::WriteRowsEvent(_) |
+                        RowsEventData::UpdateRowsEvent(_) |
                         RowsEventData::DeleteRowsEvent(_) => {
-                            events.push(ee.into_owned());
-                        },
+                            let msgs: Vec<PubsubMessage> = rowsEvent.rows(tme).map(|row| {
+                                 match row {
+                                    Ok((_before, Some(after))) => {
+                                        dbg!(&after.columns_ref().iter().map(|c| c.name_str().into()).collect::<Vec<String>>());
+                                        dbg!(&Row::try_from(after)
+                                            .unwrap() // Result
+                                            .unwrap() // as Vec
+                                            // .iter()
+                                            // .map(|a| json!(a.as_sql(true)))
+                                            // .collect::<Vec<Value>>()
+                                        );
+
+                                        PubsubMessage {
+                                           data: "test".into(),
+                                           // ordering_key: "order".into(),
+                                           ..Default::default()
+                                        }
+                                    },
+                                    _ => panic!("{:?}", row)
+                                }
+                            }).collect();
+                        }
                         _ => {}
                     }
-                }
-                EventData::TableMapEvent(ee) => {
-                    tmes.insert(ee.table_id(), ee.into_owned());
-                }
-                EventData::XidEvent(ee) => {
-                    for rowsEvent in events.iter() {
-                        dbg!(&ee.xid);
-                        dbg!(&event.header().log_pos());
 
-                        let msgs: Vec<PubsubMessage> = rowsEvent.rows(&tmes[&rowsEvent.table_id()]).map(|row| {
-                             match row {
-                                Ok((before, Some(after))) => {
-                                    for col in after.columns_ref() {
-                                        dbg!(col.name_str());
-                                    }
-                                    // dbg!(&after.columns_ref().iter().map(|c| c.name_ref().into()).collect::<Vec<String>>());
-
-                                    PubsubMessage {
-                                       data: "test".into(),
-                                       // ordering_key: "order".into(),
-                                       ..Default::default()
-                                    }
-                                },
-                                _ => panic!("{:?}", row)
-                            }
-                        }).collect();
-
-                        let mut awaiters = publisher.publish_bulk(msgs).await;
-                        // join_all(awaiters.iter().map(|awaiter| awaiter.get()).collect::<Vec<_>>()).await;
-                    }
-                    events.clear();
+                    // let mut awaiters = publisher.publish_bulk(msgs).await;
+                    // join_all(awaiters.iter().map(|awaiter| awaiter.get()).collect::<Vec<_>>()).await;
                 }
                 _ => {}
             }

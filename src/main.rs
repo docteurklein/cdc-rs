@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::collections::HashMap;
 use std::str::from_utf8;
 use std::borrow::Cow;
@@ -14,6 +15,7 @@ use anyhow::anyhow;
 use regex::Regex;
 use sqlite;
 use clap::{Parser};
+use rhai::{CallFnOptions, Dynamic, Engine, Scope, AST};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -28,11 +30,24 @@ struct Args {
 
     #[arg(short, long)]
     source: String,
+
+    #[arg(short, long)]
+    script: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Args::parse();
+
+    let rhai = Engine::new();
+    let mut scope = Scope::new();
+    let ast = cli.script.map(|path| {
+        rhai.compile_file_with_scope(&scope, path)
+    }).unwrap().unwrap();
+
+    let options = CallFnOptions::new().eval_ast(false).rewind_scope(false);
+    let result = rhai.call_fn_with_options::<(String)>(options, &mut scope, &ast, "message", ("message",));
+    dbg!(&result);
 
     let connection = sqlite::open(cli.state)?;
     connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;

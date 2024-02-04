@@ -13,16 +13,32 @@ use anyhow::Result;
 use anyhow::anyhow;
 use regex::Regex;
 use sqlite;
+use clap::{Parser};
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long)]
+    state: String,
+
+    #[arg(short, long)]
+    server_id: u32,
+
+    #[arg(short, long)]
+    regex: String,
+
+    #[arg(short, long)]
+    source: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let server_id: u32 = 1;
+    let cli = Args::parse();
 
-    let connection = sqlite::open("cdc-rs.sqlite")?;
+    let connection = sqlite::open(cli.state)?;
     connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;
 
     let mut statement = connection.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?")?;
-    statement.bind((1, server_id as i64))?;
+    statement.bind((1, cli.server_id as i64))?;
     let (mut pos, mut filename) = statement.next().and_then(|s| {
         match s {
             sqlite::State::Row => Ok((statement.read::<i64, _>("pos").unwrap(), statement.read::<String, _>("filename").unwrap())),
@@ -31,9 +47,9 @@ async fn main() -> Result<()> {
     }).unwrap_or((4, "".into()));
     dbg!(&pos, &filename);
     
-    let mut mysql = Conn::new(Opts::from_url("mysql://root:root@127.0.0.1:3306")?)?;
+    let mut mysql = Conn::new(Opts::from_url(&cli.source)?)?;
     let mut binlog_stream = mysql.get_binlog_stream(
-            BinlogRequest::new(server_id)
+            BinlogRequest::new(cli.server_id)
             .with_pos(pos as u32)
             .with_filename(filename.as_bytes().to_vec())
     )?;
@@ -76,7 +92,7 @@ async fn main() -> Result<()> {
                     }
                     let tme = tme.unwrap();
 
-                    let re = Regex::new(r"^pim.*\.pim_catalog_product$").unwrap();
+                    let re = Regex::new(&cli.regex).unwrap();
                     if ! re.is_match(&format!("{}.{}", tme.database_name(), tme.table_name())) {
                         continue;
                     }
@@ -175,7 +191,7 @@ async fn main() -> Result<()> {
                 pos = excluded.pos,
                 filename = excluded.filename
             ")?;
-            statement.bind((1, server_id as i64))?;
+            statement.bind((1, cli.server_id as i64))?;
             statement.bind((2, pos))?;
             statement.bind((3, filename.as_str()))?;
             statement.next()?;

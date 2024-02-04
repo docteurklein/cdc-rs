@@ -60,11 +60,8 @@ async fn main() -> Result<()> {
         ])),
     ]);
 
-    while let event = binlog_stream.next() {
-        if ! event.is_some() {
-            continue;
-        }
-        let event = event.unwrap()?;
+    while let Some(event) = binlog_stream.next() {
+        let event = event.unwrap();
 
         if let Some(e) = event.read_data()? {
             let msgs: Vec<PubsubMessage> = vec!();
@@ -73,7 +70,11 @@ async fn main() -> Result<()> {
                     filename = e.name().to_string();
                 }
                 EventData::RowsEvent(rowsEvent) => {
-                    let tme = &binlog_stream.get_tme(rowsEvent.table_id()).unwrap();
+                    let tme = &binlog_stream.get_tme(rowsEvent.table_id());
+                    if tme.is_none() {
+                        continue;
+                    }
+                    let tme = tme.unwrap();
 
                     let re = Regex::new(r"^pim.*\.pim_catalog_product$").unwrap();
                     if ! re.is_match(&format!("{}.{}", tme.database_name(), tme.table_name())) {
@@ -99,7 +100,7 @@ async fn main() -> Result<()> {
                                                 let col = c.name_str();
                                                 dbg!(&col);
                                                 let colName = colMap.get(tme.table_name().as_ref())
-                                                    .map_or(col.as_ref(), |t| t.get(&col.as_ref()).unwrap())
+                                                    .map_or(col.as_ref(), |t| t.get(&col.as_ref()).unwrap_or(&col.as_ref()))
                                                 ;
                                                 (colName.to_string(), c.column_type())
                                             }).collect()
@@ -167,10 +168,6 @@ async fn main() -> Result<()> {
             if event.header().log_pos() > 0 {
                 pos = event.header().log_pos() as i64;
             }
-
-            // let mut file = NamedTempFile::new()?;
-            // write!(file, "{}", event.header().log_pos())?;
-            // file.persist("./log_pos")?;
 
             let mut statement = connection.prepare("
                 insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)

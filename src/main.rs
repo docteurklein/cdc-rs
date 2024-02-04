@@ -1,63 +1,41 @@
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
 use std::collections::HashMap;
 use std::str::from_utf8;
 use std::borrow::Cow;
-use futures::future::join_all;
 use mysql::binlog::events::*;
 use mysql::binlog::EventType;
 use mysql::consts::ColumnType;
 use mysql::{Column, Row, Conn, Opts, BinlogRequest, from_value};
-// use mysql::prelude::{FromRow};
 use serde_json::*;
 use google_cloud_pubsub::client::{ClientConfig, Client};
 use google_cloud_googleapis::pubsub::v1::{PubsubMessage};
 use google_cloud_pubsub::publisher::Publisher;
 use anyhow::Result;
+use anyhow::anyhow;
 use regex::Regex;
-use tempfile::NamedTempFile;
 use sqlite;
-
-// #[derive(FromRow)]
-// #[mysql(crate_name = "cdc_rs")]
-// struct Product {
-//     id: u64,
-//     product_model_id: u64,
-//     raw_values: Value,
-// }
-
-fn read_log_pos(file: &str) -> Result<u32, std::io::Error> {
-    File::open(file).map(|f| {
-        let mut input = BufReader::new(f);
-        let mut buffer = [0_u8; std::mem::size_of::<u32>()];
-        input.read_exact(&mut buffer);
-        dbg!(&buffer);
-        u32::from_be_bytes(buffer)
-    })
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let server_id: u32 = 1;
-    // let pos: u32 = read_log_pos("./log_pos").unwrap_or(4);
 
     let connection = sqlite::open("cdc-rs.sqlite")?;
-    connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer) strict")?;
+    connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;
 
-    let mut statement = connection.prepare("select pos from log_pos where server_id = ?")?;
+    let mut statement = connection.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?")?;
     statement.bind((1, server_id as i64))?;
-    let pos = statement.next().and_then(|s| {
+    let (mut pos, mut filename) = statement.next().and_then(|s| {
         match s {
-            sqlite::State::Row => statement.read::<i64, _>("pos"),
+            sqlite::State::Row => Ok((statement.read::<i64, _>("pos").unwrap(), statement.read::<String, _>("filename").unwrap())),
             _ => sqlite::Result::Err(sqlite::Error { code: None, message: None }),
         }
-    }).unwrap_or(4);
-    dbg!(&pos);
+    }).unwrap_or((4, "".into()));
+    dbg!(&pos, &filename);
     
     let mut mysql = Conn::new(Opts::from_url("mysql://root:root@127.0.0.1:3306")?)?;
     let mut binlog_stream = mysql.get_binlog_stream(
             BinlogRequest::new(server_id)
             .with_pos(pos as u32)
+            .with_filename(filename.as_bytes().to_vec())
     )?;
     let mut events: Vec<RowsEventData> = vec!();
 
@@ -82,10 +60,18 @@ async fn main() -> Result<()> {
         ])),
     ]);
 
-    while let Some(Ok(event)) = binlog_stream.next() {
+    while let event = binlog_stream.next() {
+        if ! event.is_some() {
+            continue;
+        }
+        let event = event.unwrap()?;
+
         if let Some(e) = event.read_data()? {
             let msgs: Vec<PubsubMessage> = vec!();
             match e {
+                EventData::RotateEvent(e) => {
+                    filename = e.name().to_string();
+                }
                 EventData::RowsEvent(rowsEvent) => {
                     let tme = &binlog_stream.get_tme(rowsEvent.table_id()).unwrap();
 
@@ -111,6 +97,7 @@ async fn main() -> Result<()> {
                                         let cols: Vec<(String, ColumnType)> = rowImage.clone().map(|rowImage| {
                                             rowImage.columns_ref().iter().map(|c| {
                                                 let col = c.name_str();
+                                                dbg!(&col);
                                                 let colName = colMap.get(tme.table_name().as_ref())
                                                     .map_or(col.as_ref(), |t| t.get(&col.as_ref()).unwrap())
                                                 ;
@@ -177,14 +164,26 @@ async fn main() -> Result<()> {
                 _ => {}
             }
 
+            if event.header().log_pos() > 0 {
+                pos = event.header().log_pos() as i64;
+            }
+
             // let mut file = NamedTempFile::new()?;
             // write!(file, "{}", event.header().log_pos())?;
             // file.persist("./log_pos")?;
 
-            let mut statement = connection.prepare("insert into log_pos (server_id, pos) values (?, ?) on conflict do update set pos = excluded.pos")?;
+            let mut statement = connection.prepare("
+                insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
+                on conflict do update set
+                pos = excluded.pos,
+                filename = excluded.filename
+            ")?;
             statement.bind((1, server_id as i64))?;
-            statement.bind((2, event.header().log_pos() as i64))?;
+            statement.bind((2, pos))?;
+            statement.bind((3, filename.as_str()))?;
             statement.next()?;
+
+            dbg!(&pos, &filename);
         }
     }
     Ok(())

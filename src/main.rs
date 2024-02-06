@@ -1,22 +1,20 @@
 use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
-use std::borrow::Cow;
+
 use mysql::binlog::events::*;
-use mysql::binlog::EventType;
-use mysql::consts::ColumnType;
-use mysql::{Column, Row, Conn, Opts, BinlogRequest, from_value};
-use serde_json::*;
-use serde::{Serialize};
+use mysql::binlog::row::BinlogRow;
+
+use mysql::{Row, Conn, Opts, BinlogRequest};
+// use serde_json::*;
 use google_cloud_pubsub::client::{ClientConfig, Client};
-use google_cloud_googleapis::pubsub::v1::{PubsubMessage};
+use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::publisher::Publisher;
 use anyhow::Result;
-use anyhow::anyhow;
 use regex::Regex;
-use sqlite;
-use clap::{Parser};
-use rhai::{CallFnOptions, Dynamic, Engine, Scope, AST, CustomType, TypeBuilder};
+use clap::Parser;
+use anyhow::Error;
+use rhai::{Dynamic, Engine, Scope};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -46,7 +44,7 @@ struct Args {
 async fn main() -> Result<()> {
     let cli = Args::parse();
 
-    let mut rhai = Engine::new();
+    let rhai = Engine::new();
     // rhai.build_type::<Event>();
 
     let mut scope = Scope::new();
@@ -71,13 +69,12 @@ async fn main() -> Result<()> {
 
     let mut new_filename: String = filename.clone();
     
-    let mut mysql = Conn::new(Opts::from_url(&cli.source)?)?;
+    let mysql = Conn::new(Opts::from_url(&cli.source)?)?;
     let mut binlog_stream = mysql.get_binlog_stream(
             BinlogRequest::new(cli.server_id)
             .with_pos(pos as u32)
             .with_filename(filename.as_bytes().to_vec())
     )?;
-    let mut events: Vec<RowsEventData> = vec!();
 
     let pubsub = Client::new(
         ClientConfig::default().with_auth().await?
@@ -85,26 +82,15 @@ async fn main() -> Result<()> {
 
     let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
 
-    while let Some(event) = binlog_stream.next() {
-        let event = event.unwrap();
+    while let Some(Ok(event)) = binlog_stream.next() {
 
         if let Some(e) = event.read_data()? {
-            let msgs: Vec<PubsubMessage> = vec!();
             match e {
                 EventData::RotateEvent(e) => {
                     new_filename = e.name().to_string();
                 }
-                // EventData::TableMapEvent(e) => {
-                //     tmes.insert(e.table_id(), e);
-                // }
-                EventData::RowsEvent(rowsEvent) => {
-                    // let tme = tmes.get(&rowsEvent.table_id()).unwrap();
-                    let tme = binlog_stream.get_tme(rowsEvent.table_id());
-                    // let tme = tmes.get(rowsEvent.table_id()).unwrap();
-                    if tme.is_none() {
-                        continue;
-                    }
-                    let tme = tme.unwrap();
+                EventData::RowsEvent(rows_event) => {
+                    let tme = binlog_stream.get_tme(rows_event.table_id()).unwrap();
                     let (db, table) = (tme.database_name().to_string(), tme.table_name().to_string());
 
                     let re = Regex::new(&cli.regex).unwrap();
@@ -112,72 +98,28 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    let changeType = match rowsEvent {
+                    let change_type = match rows_event {
                         RowsEventData::WriteRowsEvent(_) => "UPSERT",
                         RowsEventData::UpdateRowsEvent(_) => "UPSERT",
                         RowsEventData::DeleteRowsEvent(_) => "DELETE",
                         _ => ""
                     };
 
-                    match rowsEvent {
+                    match rows_event {
                         RowsEventData::WriteRowsEvent(_) |
                         RowsEventData::UpdateRowsEvent(_) |
                         RowsEventData::DeleteRowsEvent(_) => {
-                            let msgs: Vec<PubsubMessage> = rowsEvent.clone().rows(tme).map(|row| {
+                            let msgs: Vec<PubsubMessage> = rows_event.clone().rows(tme).map(|row| {
                                  match row {
                                     Ok((before, after)) => {
-                                        let rowImage = after.or(before);
 
-                                        let cols: Vec<String> = rowImage.as_ref().map(|rowImage| {
-                                            rowImage.columns_ref().iter().map(|c| {
-                                                c.name_str().to_string()
-                                            }).collect()
-                                        }).unwrap();
-                                        
-                                        let mut fields: rhai::Map = Row::try_from(rowImage.unwrap())
-                                            .unwrap() // Result
-                                            .unwrap() // as Vec
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, mv)| {
-                                                let k = cols.get(i).unwrap();
-                                                let v = match mv {
-                                                    mysql::Value::NULL => Dynamic::from(()),
-                                                    mysql::Value::Bytes(ref bytes) => match from_utf8(&*bytes) {
-                                                        Ok(v) => Dynamic::from(v.to_string()),
-                                                        Err(_) => {
-                                                            let mut s = String::from("0x");
-                                                            for c in bytes.iter() {
-                                                                s.extend(format!("{:02X}", *c).chars())
-                                                            }
-                                                            Dynamic::from(s)
-                                                        },
-                                                    }
-                                                    mysql::Value::Int(v) => Dynamic::from(v.clone()),
-                                                    mysql::Value::UInt(v) => Dynamic::from(v.clone()),
-                                                    mysql::Value::Float(v) => Dynamic::from(v.clone()),
-                                                    mysql::Value::Double(v) => Dynamic::from(v.clone()),
-                                                    // mysql::Value::Date(v) => Dynamic::from(v),
-                                                    // mysql::Value::Time(v) => Dynamic::from(v),
-                                                    _ => Dynamic::from("NOPE"),
-                                                };
-                                                (k.into(), v)
-                                            })
-                                            .collect()
-                                        ;
-                                        // fields.insert("_CHANGE_TYPE".into(), Dynamic::from(changeType));
-                                        // fields.insert("db".into(), Dynamic::from(db.clone()));
-
-                                        // let event = Event {
-                                        //     after: fields,
-                                        // };
-                                        // dbg!(&json!(event));
-                                        // let dynFields = fields.clone();
+                                        let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), |before| before);
+                                        let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), |after| after);
 
                                         let fields = rhai
-                                            .call_fn::<rhai::Map>(&mut scope, &ast, "transform", (db.clone(), table.clone(), changeType, fields.clone()))
+                                            .call_fn::<rhai::Map>(&mut scope, &ast, "transform", (db.clone(), table.clone(), change_type, before.clone(), after.clone()))
                                             .map_err(|e| dbg!(e))
-                                            .unwrap_or(fields)
+                                            .unwrap()
                                         ;
                                         dbg!(&fields);
 
@@ -192,9 +134,9 @@ async fn main() -> Result<()> {
 
                             let publisher = publishers.entry(tme.table_name().to_string()).or_insert_with(|| {
                                 let topic = rhai
-                                    .call_fn::<String>(&mut scope, &ast, "topic", (db, tme.table_name().to_string(),))
+                                    .call_fn::<String>(&mut scope, &ast, "topic", (db, table.clone(),))
                                     .map_err(|e| dbg!(e))
-                                    .unwrap_or(tme.table_name().to_string())
+                                    .unwrap_or(table.clone())
                                 ;
                                 dbg!(&topic);
                                 pubsub.topic(&topic).new_publisher(None)
@@ -226,4 +168,42 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {
+    let cols: Vec<String> = row_image.columns_ref().iter().map(|c| {
+        c.name_str().to_string()
+    }).collect();
+
+    let fields: rhai::Map = Row::try_from(row_image).unwrap()
+        .unwrap() // as Vec
+        .iter()
+        .enumerate()
+        .map(|(i, mv)| {
+            let k = cols.get(i).unwrap();
+            let v = match mv {
+                mysql::Value::NULL => Dynamic::from(()),
+                mysql::Value::Bytes(ref bytes) => match from_utf8(bytes) {
+                    Ok(v) => Dynamic::from(v.to_string()),
+                    Err(_) => {
+                        let mut s = String::from("0x");
+                        for c in bytes.iter() {
+                            s.extend(format!("{:02X}", *c).chars())
+                        }
+                        Dynamic::from(s)
+                    },
+                }
+                mysql::Value::Int(v) => Dynamic::from(*v),
+                mysql::Value::UInt(v) => Dynamic::from(*v),
+                mysql::Value::Float(v) => Dynamic::from(*v),
+                mysql::Value::Double(v) => Dynamic::from(*v),
+                // mysql::Value::Date(v) => Dynamic::from(v),
+                // mysql::Value::Time(v) => Dynamic::from(v),
+                _ => Dynamic::from("NOPE"),
+            };
+            (k.into(), v)
+        })
+        .collect()
+    ;
+    fields
 }

@@ -341,10 +341,7 @@ dependencies = [
  "mysql",
  "regex",
  "rhai",
- "serde",
- "serde_json",
  "sqlite",
- "tempfile",
  "tokio",
 ]
 

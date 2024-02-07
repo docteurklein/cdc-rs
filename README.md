@@ -1,13 +1,14 @@
 # what?
 
-A rust-based mysql replication client that emits a modifiable pubsub message for each changed mysql row.
+A rust-based mysql replication client that emits a pubsub message for each changed mysql row.  
+Replication position state is stored client-side using a disk-based sqlite db for now.
 
 # why?
 
 Because debezium is bad to tweak.  
 Instead of using debezium SingleMessageTransformers, this instead uses an embedded scripting language (rhai) to transfom messages and destination topics.
 
-This enable easier CDC use-cases, for example: mysql -> cdc-rs -> pubsub topic -> bigquery subscription -> CDC-enabled bigquery table.
+This enables easier CDC use-cases, for example: mysql -> cdc-rs -> pubsub topic -> bigquery subscription -> CDC-enabled bigquery table.
 
 
 # how?

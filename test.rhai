@@ -36,6 +36,7 @@ fn transform(db, table, changeType, before, after) {
 	let to = rename(table, after);
 	to.db = db;
 	to._CHANGE_TYPE = changeType;
+	to.remove("@10");
 	to
 
 	// #{

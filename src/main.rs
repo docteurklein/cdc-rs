@@ -121,7 +121,6 @@ async fn main() -> Result<()> {
                                             .map_err(|e| dbg!(e))
                                             .unwrap()
                                         ;
-                                        dbg!(&fields);
 
                                         PubsubMessage {
                                             data: rhai::format_map_as_json(&fields).into(),
@@ -163,8 +162,6 @@ async fn main() -> Result<()> {
             statement.bind((2, pos))?;
             statement.bind((3, filename.as_str()))?;
             statement.next()?;
-
-            dbg!(&pos, &filename);
         }
     }
     Ok(())

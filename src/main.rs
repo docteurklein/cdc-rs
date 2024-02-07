@@ -89,8 +89,8 @@ async fn main() -> Result<()> {
                     }
 
                     let change_type = match rows_event {
-                        RowsEventData::WriteRowsEvent(_) => "UPSERT",
-                        RowsEventData::UpdateRowsEvent(_) => "UPSERT",
+                        RowsEventData::WriteRowsEvent(_) => "INSERT",
+                        RowsEventData::UpdateRowsEvent(_) => "UPDATE",
                         RowsEventData::DeleteRowsEvent(_) => "DELETE",
                         _ => ""
                     };
@@ -112,8 +112,10 @@ async fn main() -> Result<()> {
                                             .unwrap()
                                         ;
 
+                                        let data = rhai::format_map_as_json(&fields);
+                                        dbg!(&data);
                                         PubsubMessage {
-                                            data: rhai::format_map_as_json(&fields).into(),
+                                            data: data.into(),
                                             ..Default::default()
                                         }
                                     },

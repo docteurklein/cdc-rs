@@ -47,10 +47,32 @@ cdc-rs \
 Where `script.rhai` contains:
 
 ```
+fn debezium(db, table, changeType, before, after) {
+	let ts = timestamp();
+	#{
+		payload: #{
+			before: before,
+			after: after,
+			op: switch changeType {
+				"INSERT" => "c",
+				"UPDATE" => "u",
+				"DELETE" => "d",
+				_ => changeType,
+			},
+			source: #{
+				ts_ms: `${ts}`,
+				db: db,
+				table: table,
+			},
+			ts_ms: `${ts}`,
+		}
+	}
+}
+
 fn transform(db, table, changeType, before, after) {
-  after.db = db;
-  after._CHANGE_TYPE = changeType;
-  after
+	before.tenant = db;
+	after.tenant = db;
+	debezium(db, table, changeType, before, after)
 }
 
 fn topic(db, table) {

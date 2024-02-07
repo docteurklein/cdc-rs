@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                                         let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), |after| after);
 
                                         let fields = rhai
-                                            .call_fn::<rhai::Map>(&mut scope, &ast, "transform", (db.clone(), table.clone(), change_type, before.clone(), after.clone()))
+                                            .call_fn::<rhai::Map>(&mut scope, &ast, "transform", (db.clone(), table.clone(), change_type, before, after))
                                             .map_err(|e| dbg!(e))
                                             .unwrap()
                                         ;

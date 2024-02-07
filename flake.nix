@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    kubenix = {
+      url = "github:hall/kubenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -20,7 +24,7 @@
     allow-import-from-derivation = true;
   };
 
-  outputs = inputs @ { self , nixpkgs , flake-parts , crate2nix , nix2container , ... }:
+  outputs = inputs @ { self , nixpkgs , flake-parts , crate2nix , nix2container , kubenix, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
@@ -28,14 +32,15 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-
-      imports = [
-      ];
-
       perSystem = { system, pkgs, lib, inputs', ... }:
         let
           nix2c = nix2container.packages.${system}.nix2container;
           cargoNix = inputs.crate2nix.tools.${system}.appliedCargoNix {
+            name = "cdc-rs";
+            src = ./.;
+          };
+
+          cdc-rs = inputs.crate2nix.tools.${system}.appliedCargoNix {
             name = "cdc-rs";
             src = ./.;
           };
@@ -64,31 +69,71 @@
           packages = {
             default = packages.cdc-rs;
 
-            cdc-rs = (inputs.crate2nix.tools.${system}.appliedCargoNix {
-              name = "cdc-rs";
-              src = ./.;
-            }).rootCrate.build;
+            cdc-rs = cdc-rs.rootCrate.build;
 
-            cdc-rs-bis = pkgs.rustPlatform.buildRustPackage {
-              pname = "cdc-rs";
-              version = "0.1.0";
-              src = ./.;
-              cargoLock.lockFile = ./Cargo.lock;
+            # cdc-rs-bis = pkgs.rustPlatform.buildRustPackage {
+            #   pname = "cdc-rs";
+            #   version = "0.1.0";
+            #   src = ./.;
+            #   cargoLock.lockFile = ./Cargo.lock;
 
-              nativeBuildInputs = with pkgs; [
-                openssl.dev
-                pkg-config
-              ];
-            };
+            #   nativeBuildInputs = with pkgs; [
+            #     openssl.dev
+            #     pkg-config
+            #   ];
+            # };
 
-            docker = nix2c.buildImage {
+            oci-image = nix2c.buildImage {
               name = "docteurklein/cdc-rs";
               maxLayers = 125;
-              # resolvedByNix = true;
               config = {
                 Entrypoint = [ "${packages.cdc-rs}/bin/cdc-rs" ];
               };
             };
+
+            kube = (kubenix.evalModules.${system} {
+              module = { kubenix, config, ... }: {
+                imports = [
+                  kubenix.modules.k8s
+                  kubenix.modules.docker
+                ];
+
+                docker = {
+                  registry.url = "docker.io";
+                  images.cdc-rs.image = self.packages.${system}.oci-image;
+                };
+
+                kubernetes.resources.deployments."cdc-rs".spec = {
+                  selector.matchLabels.app = "cdc-rs";
+                  template.spec = {
+                    containers."cdc-rs" = {
+                      image = config.docker.images."cdc-rs".path;
+                      imagePullPolicy = "IfNotPresent";
+                      volumeMounts = {
+                        "/etc/cdc-rs/script.rhai".name = "cdc-rs-script";
+                        "/etc/cdc-rs/state.sqlite".name = "cdc-rs-state";
+                      };
+                    };
+                    volumes = {
+                      config.configMap.name = "cdc-rs-script";
+                      config.persistentVolumeClaim.claimName = "cdc-rs-state";
+                    };
+                  };
+                };
+
+                kubernetes.resources.configMaps."cdc-rs-script".data."script.rhai" = builtins.readFile ./test.rhai;
+
+                kubernetes.resources.persistentVolumeClaims."cdc-rs-state" = {
+                  metadata.name = "cdc-rs-state";
+                  spec = {
+                    accessModes = [
+                      "ReadWriteOnce"
+                    ];
+                    resources.requests.storage = "100Mi";
+                  };
+                };
+              };
+            }).config.kubernetes.result;
           };
       };
     };

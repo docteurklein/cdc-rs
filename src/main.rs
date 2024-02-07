@@ -13,46 +13,36 @@ use google_cloud_pubsub::publisher::Publisher;
 use anyhow::Result;
 use regex::Regex;
 use clap::Parser;
-use anyhow::Error;
 use rhai::{Dynamic, Engine, Scope};
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long)]
+    #[arg(short, long, env)]
     state: String,
 
-    #[arg(short, long)]
+    #[arg(short, long, env)]
     server_id: u32,
 
-    #[arg(short, long)]
+    #[arg(short, long, env)]
     regex: String,
 
-    #[arg(short, long)]
+    #[arg(short, long, env)]
     source: String,
 
-    #[arg(short, long)]
+    #[arg(short, long, env)]
     script: Option<PathBuf>,
 }
-
-// #[derive(Debug, Clone, CustomType, Serialize)]
-// #[rhai_type()]
-// struct Event {
-//     after: BTreeMap<String, Value>,
-// }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Args::parse();
 
     let rhai = Engine::new();
-    // rhai.build_type::<Event>();
 
     let mut scope = Scope::new();
     let ast = cli.script.map(|path| {
         rhai.compile_file_with_scope(&scope, path)
     }).unwrap().unwrap();
-
-    // let options = CallFnOptions::new().eval_ast(false).rewind_scope(false);
 
     let connection = sqlite::open(cli.state)?;
     connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;

@@ -37,6 +37,7 @@ fn transform(db, table, changeType, before, after) {
 	to.db = db;
 	to._CHANGE_TYPE = changeType;
 	to.remove("@10");
+	print(to);
 	to
 
 	// #{

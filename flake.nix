@@ -2,6 +2,10 @@
   description = "cdc-rs";
 
   inputs = {
+    # params = {
+    #   url = "./test";
+    #   flake = false;
+    # };
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     kubenix = {
       url = "github:hall/kubenix";
@@ -62,6 +66,8 @@
                 openssl.dev
                 pkg-config
                 rust-analyzer-unwrapped
+                k3s
+                kubectl
               ];
             };
           };
@@ -99,25 +105,35 @@
                 ];
 
                 docker = {
-                  registry.url = "docker.io";
+                  # registry.url = "docker.io";
                   images.cdc-rs.image = self.packages.${system}.oci-image;
                 };
 
                 kubernetes.resources.deployments."cdc-rs".spec = {
                   selector.matchLabels.app = "cdc-rs";
+                  template.metadata.labels.app = "cdc-rs";
                   template.spec = {
                     containers."cdc-rs" = {
                       image = config.docker.images."cdc-rs".path;
                       imagePullPolicy = "IfNotPresent";
                       volumeMounts = {
-                        "/etc/cdc-rs/script.rhai".name = "cdc-rs-script";
-                        "/etc/cdc-rs/state.sqlite".name = "cdc-rs-state";
+                        "/script/cdc-rs".name = "cdc-rs-script";
+                        "/state/cdc-rs".name = "cdc-rs-state";
                       };
+                      args = [
+                        "--state" "/state/cdc-rs/state.sqlite"
+                        "--server-id" "1"
+                        # "--regex" ".*"
+                        "--script" "/script/cdc-rs/script.rhai"
+                      ];
+                      env = [
+                        { name = "SOURCE"; value = "mysql://mysql:3306"; }
+                      ];
                     };
-                    volumes = {
-                      config.configMap.name = "cdc-rs-script";
-                      config.persistentVolumeClaim.claimName = "cdc-rs-state";
-                    };
+                    volumes = [
+                      { name = "cdc-rs-script"; configMap.name = "cdc-rs-script"; }
+                      { name = "cdc-rs-state"; persistentVolumeClaim.claimName = "cdc-rs-state"; }
+                    ];
                   };
                 };
 

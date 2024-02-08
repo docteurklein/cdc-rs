@@ -1,12 +1,9 @@
 use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
-
 use mysql::binlog::events::*;
 use mysql::binlog::row::BinlogRow;
-
 use mysql::{Row, Conn, Opts, BinlogRequest};
-// use serde_json::*;
 use google_cloud_pubsub::client::{ClientConfig, Client};
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::publisher::Publisher;
@@ -72,7 +69,8 @@ async fn main() -> Result<()> {
 
     let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
 
-    while let Some(Ok(event)) = binlog_stream.next() {
+    while let Some(event) = binlog_stream.next() {
+        let event = event.unwrap();
 
         if let Some(e) = event.read_data()? {
             match e {

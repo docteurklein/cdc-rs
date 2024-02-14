@@ -11,6 +11,8 @@ use anyhow::Result;
 use regex::Regex;
 use clap::Parser;
 use rhai::{Dynamic, Engine, Scope};
+use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -36,17 +38,39 @@ async fn main() -> Result<()> {
 
     let rhai = Engine::new();
 
+    let (tx, mut rx) = mpsc::channel::<(i64, String)>(12);
+
+    let connection = Arc::new(Mutex::new(sqlite::open(&cli.state)?));
+    let conn_persist = Arc::clone(&connection);
+
+    let persister = tokio::spawn(async move {
+        while let Some((pos, filename)) = rx.recv().await {
+            let lock = conn_persist.lock().unwrap();
+            let mut statement = lock.prepare("
+                insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
+                on conflict do update set
+                pos = excluded.pos,
+                filename = excluded.filename
+            ").unwrap();
+            statement.bind((1, cli.server_id as i64)).unwrap();
+            statement.bind((2, pos)).unwrap();
+            statement.bind((3, filename.as_str())).unwrap();
+            statement.next().unwrap();
+            ()
+        }
+    });
+
     let mut scope = Scope::new();
     let ast = cli.script.map(|path| {
         rhai.compile_file_with_scope(&scope, path)
     }).unwrap().unwrap();
 
-    let connection = sqlite::open(cli.state)?;
-    connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;
+    let lock = connection.lock().unwrap();
+    lock.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;
 
-    let mut statement = connection.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?")?;
+    let mut statement = lock.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?")?;
     statement.bind((1, cli.server_id as i64))?;
-    let (mut pos, mut filename) = statement.next().and_then(|s| {
+    let (pos, filename) = statement.next().and_then(|s| {
         match s {
             sqlite::State::Row => Ok((statement.read::<i64, _>("pos").unwrap(), statement.read::<String, _>("filename").unwrap())),
             _ => sqlite::Result::Err(sqlite::Error { code: None, message: None }),
@@ -54,8 +78,6 @@ async fn main() -> Result<()> {
     }).unwrap_or((4, "".into()));
     dbg!(&pos, &filename);
 
-    let mut new_filename: String = filename.clone();
-    
     let mysql = Conn::new(Opts::from_url(&cli.source)?)?;
     let mut binlog_stream = mysql.get_binlog_stream(
             BinlogRequest::new(cli.server_id)
@@ -75,7 +97,7 @@ async fn main() -> Result<()> {
         if let Some(e) = event.read_data()? {
             match e {
                 EventData::RotateEvent(e) => {
-                    new_filename = e.name().to_string();
+                    tx.send((event.header().log_pos() as i64, e.name().to_string())).await?;
                 }
                 EventData::RowsEvent(rows_event) => {
                     let tme = binlog_stream.get_tme(rows_event.table_id()).unwrap();
@@ -104,8 +126,10 @@ async fn main() -> Result<()> {
                                         let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), |before| before);
                                         let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), |after| after);
 
+                                        let ts = event.header().timestamp();
+
                                         let fields = rhai
-                                            .call_fn::<rhai::Map>(&mut scope, &ast, "transform", (db.clone(), table.clone(), change_type, before, after))
+                                            .call_fn::<rhai::Map>(&mut scope, &ast, "transform", (db.clone(), table.clone(), change_type, before, after, ts))
                                             .map_err(|e| dbg!(e))
                                             .unwrap()
                                         ;
@@ -133,27 +157,17 @@ async fn main() -> Result<()> {
                     
                             publisher.publish_immediately(msgs, None).await?;
 
-                            pos = event.header().log_pos() as i64;
-                            filename = new_filename.clone();
+                            tx.send((event.header().log_pos() as i64, filename.clone())).await?;
                         }
                         _ => {}
                     }
                 }
                 _ => {}
             }
-
-            let mut statement = connection.prepare("
-                insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
-                on conflict do update set
-                pos = excluded.pos,
-                filename = excluded.filename
-            ")?;
-            statement.bind((1, cli.server_id as i64))?;
-            statement.bind((2, pos))?;
-            statement.bind((3, filename.as_str()))?;
-            statement.next()?;
         }
     }
+    persister.await?;
+
     Ok(())
 }
 

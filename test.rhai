@@ -32,8 +32,7 @@ fn rename(table, fields) {
 	to
 }
 
-fn debezium(db, table, changeType, before, after) {
-	let ts = timestamp();
+fn debezium(db, table, changeType, before, after, ts) {
 	#{
 		payload: #{
 			before: before,
@@ -45,11 +44,11 @@ fn debezium(db, table, changeType, before, after) {
 				_ => changeType,
 			},
 			source: #{
-				ts_ms: `${ts}`,
+				ts_ms: ts,
 				db: db,
 				table: table,
 			},
-			ts_ms: `${ts}`,
+			ts_ms: ts,
 		}
 	}
 }
@@ -64,7 +63,7 @@ fn bigquery(db, table, changeType, before, after) {
 	};
 	fields
 }
-fn transform(db, table, changeType, before, after) {
+fn transform(db, table, changeType, before, after, ts) {
 	before.tenant = db;
 	after.tenant = db;
 	bigquery(db, table, changeType, rename(table, before), rename(table, after))

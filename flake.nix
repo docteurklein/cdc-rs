@@ -122,12 +122,12 @@
                       };
                       args = [
                         "--state" "/state/cdc-rs/state.sqlite"
-                        "--server-id" "1"
-                        # "--regex" ".*"
                         "--script" "/script/cdc-rs/script.rhai"
                       ];
                       env = [
-                        { name = "SOURCE"; value = "mysql://mysql:3306"; }
+                        { name = "SOURCE"; value = ""; }
+                        { name = "REGEX"; value = ""; }
+                        { name = "SERVER_ID"; value = ""; }
                       ];
                     };
                     volumes = [

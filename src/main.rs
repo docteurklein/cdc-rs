@@ -45,7 +45,6 @@ enum ChangeType {
 
 impl fmt::Display for ChangeType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // write!(f, "{:?}", self)
         fmt::Debug::fmt(self, f)
     }
 }
@@ -167,7 +166,6 @@ async fn main() -> Result<()> {
                  pubsub.topic(&topic).new_publisher(None)
             });
 
-            dbg!(&msgs);
             publisher.publish_immediately(msgs, None).await?;
         };
         Ok::<(), Error>(())
@@ -237,9 +235,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // transformer_thread.join().unwrap();
+    transformer_thread.join().unwrap();
 
-    publisher_task.await?
+    futures::future::join_all(vec!(
+        publisher_task,
+        log_pos_task
+    )).await;
+
+    Ok(())
 }
 
 fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {

@@ -1,3 +1,4 @@
+use std::convert::identity;
 use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
@@ -7,12 +8,11 @@ use mysql::{Row, Conn, Opts, BinlogRequest};
 use google_cloud_pubsub::client::{ClientConfig, Client};
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::publisher::Publisher;
-use anyhow::Result;
+use anyhow::{Error, Result};
 use regex::Regex;
 use clap::Parser;
 use rhai::{Dynamic, Engine, Scope};
 use tokio::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -32,6 +32,23 @@ struct Args {
     script: Option<PathBuf>,
 }
 
+fn setup_state(path: &String, server_id: u32) -> Result<(i64, String), Error> {
+    let connection = sqlite::open(path)?;
+
+    connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;
+
+    let mut statement = connection.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?")?;
+    statement.bind((1, server_id as i64))?;
+    let (pos, filename) = statement.next().and_then(|s| {
+        match s {
+            sqlite::State::Row => Ok((statement.read::<i64, _>("pos").unwrap(), statement.read::<String, _>("filename").unwrap())),
+            _ => sqlite::Result::Err(sqlite::Error { code: None, message: None }),
+        }
+    }).unwrap_or((4, "".into()));
+
+    Ok((pos, filename))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Args::parse();
@@ -40,13 +57,18 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<(i64, String)>(12);
 
-    let connection = Arc::new(Mutex::new(sqlite::open(&cli.state)?));
-    let conn_persist = Arc::clone(&connection);
+    let mut scope = Scope::new();
+    let ast = cli.script.map(|path| {
+        rhai.compile_file_with_scope(&scope, path)
+    }).unwrap().unwrap();
 
+    let (pos, mut filename) = setup_state(&cli.state, cli.server_id)?;
+    dbg!(&pos, &filename);
+
+    let connection = sqlite::open(&cli.state.clone()).unwrap();
     let persister = tokio::spawn(async move {
         while let Some((pos, filename)) = rx.recv().await {
-            let lock = conn_persist.lock().unwrap();
-            let mut statement = lock.prepare("
+            let mut statement = connection.prepare("
                 insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
                 on conflict do update set
                 pos = excluded.pos,
@@ -56,27 +78,10 @@ async fn main() -> Result<()> {
             statement.bind((2, pos)).unwrap();
             statement.bind((3, filename.as_str())).unwrap();
             statement.next().unwrap();
+            dbg!((pos, filename));
             ()
         }
     });
-
-    let mut scope = Scope::new();
-    let ast = cli.script.map(|path| {
-        rhai.compile_file_with_scope(&scope, path)
-    }).unwrap().unwrap();
-
-    let lock = connection.lock().unwrap();
-    lock.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;
-
-    let mut statement = lock.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?")?;
-    statement.bind((1, cli.server_id as i64))?;
-    let (pos, filename) = statement.next().and_then(|s| {
-        match s {
-            sqlite::State::Row => Ok((statement.read::<i64, _>("pos").unwrap(), statement.read::<String, _>("filename").unwrap())),
-            _ => sqlite::Result::Err(sqlite::Error { code: None, message: None }),
-        }
-    }).unwrap_or((4, "".into()));
-    dbg!(&pos, &filename);
 
     let mysql = Conn::new(Opts::from_url(&cli.source)?)?;
     let mut binlog_stream = mysql.get_binlog_stream(
@@ -85,9 +90,9 @@ async fn main() -> Result<()> {
             .with_filename(filename.as_bytes().to_vec())
     )?;
 
-    let pubsub = Client::new(
-        ClientConfig::default().with_auth().await?
-    ).await?;
+    // let pubsub = Client::new(
+    //     ClientConfig::default().with_auth().await?
+    // ).await?;
 
     let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
 
@@ -97,7 +102,8 @@ async fn main() -> Result<()> {
         if let Some(e) = event.read_data()? {
             match e {
                 EventData::RotateEvent(e) => {
-                    tx.send((event.header().log_pos() as i64, e.name().to_string())).await?;
+                    filename = e.name().to_string();
+                    // tx.send((event.header().log_pos() as i64, filename)).await?;
                 }
                 EventData::RowsEvent(rows_event) => {
                     let tme = binlog_stream.get_tme(rows_event.table_id()).unwrap();
@@ -123,8 +129,8 @@ async fn main() -> Result<()> {
                                  match row {
                                     Ok((before, after)) => {
 
-                                        let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), |before| before);
-                                        let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), |after| after);
+                                        let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
+                                        let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
 
                                         let ts = event.header().timestamp();
 
@@ -145,24 +151,26 @@ async fn main() -> Result<()> {
                                 }
                             }).collect();
 
-                            let publisher = publishers.entry(tme.table_name().to_string()).or_insert_with(|| {
-                                let topic = rhai
-                                    .call_fn::<String>(&mut scope, &ast, "topic", (db, table.clone(),))
-                                    .map_err(|e| dbg!(e))
-                                    .unwrap_or(table.clone())
-                                ;
-                                dbg!(&topic);
-                                pubsub.topic(&topic).new_publisher(None)
-                            });
+                            // let publisher = publishers.entry(tme.table_name().to_string()).or_insert_with(|| {
+                            //     let topic = rhai
+                            //         .call_fn::<String>(&mut scope, &ast, "topic", (db, table.clone(),))
+                            //         .map_err(|e| dbg!(e))
+                            //         .unwrap_or(table.clone())
+                            //     ;
+                            //     dbg!(&topic);
+                            //     pubsub.topic(&topic).new_publisher(None)
+                            // });
                     
-                            publisher.publish_immediately(msgs, None).await?;
+                            //publisher.publish_immediately(msgs, None).await?;
 
-                            tx.send((event.header().log_pos() as i64, filename.clone())).await?;
                         }
                         _ => {}
                     }
                 }
                 _ => {}
+            }
+            if event.header().log_pos() > 0 {
+                tx.send((event.header().log_pos() as i64, filename.clone())).await?;
             }
         }
     }

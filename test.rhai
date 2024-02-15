@@ -23,6 +23,9 @@ const colMap = #{
 };
 
 fn rename(table, fields) {
+	if table not in global::colMap {
+		return fields;
+	}
 	let to = #{};
 	let t = global::colMap[table];
 	for k in fields.keys() {
@@ -67,6 +70,7 @@ fn transform(db, table, changeType, before, after, ts) {
 	before.tenant = db;
 	after.tenant = db;
 	bigquery(db, table, changeType, rename(table, before), rename(table, after))
+	// bigquery(db, table, changeType, before, after)
 }
 
 fn topic(db, table) {

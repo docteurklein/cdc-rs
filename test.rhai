@@ -23,11 +23,11 @@ const colMap = #{
 };
 
 fn rename(table, fields) {
-	if table not in global::colMap {
+	let t = global::colMap[table];
+	if t == () {
 		return fields;
 	}
 	let to = #{};
-	let t = global::colMap[table];
 	for k in fields.keys() {
 		let nk = t[k] ?? k;
 		to.set(nk, fields[k]);
@@ -41,9 +41,9 @@ fn debezium(db, table, changeType, before, after, ts) {
 			before: before,
 			after: after,
 			op: switch changeType {
-				"INSERT" => "c",
-				"UPDATE" => "u",
-				"DELETE" => "d",
+				"Insert" => "c",
+				"Update" => "u",
+				"Delete" => "d",
 				_ => changeType,
 			},
 			source: #{
@@ -57,11 +57,11 @@ fn debezium(db, table, changeType, before, after, ts) {
 }
 
 fn bigquery(db, table, changeType, before, after) {
-	let fields = if changeType == "DELETE" { before } else { after };
+	let fields = if changeType == "Delete" { before } else { after };
 	fields._CHANGE_TYPE = switch changeType {
-		"INSERT" => "UPSERT",
-		"UPDATE" => "UPSERT",
-		"DELETE" => "DELETE",
+		"Insert" => "UPSERT",
+		"Update" => "UPSERT",
+		"Delete" => "DELETE",
 		_ => changeType,
 	};
 	fields

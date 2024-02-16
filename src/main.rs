@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
             statement.bind((2, pos))?;
             statement.bind((3, filename.as_str()))?;
             statement.next()?;
-            dbg!((pos, filename));
+            // dbg!((pos, filename));
         }
         Ok::<(), Error>(())
     });
@@ -142,7 +142,10 @@ async fn main() -> Result<()> {
                 .unwrap_or(table.to_string())
             ;
 
-            pubsub_tx.send((topic, msgs)).map_err(|e| dbg!(e)).unwrap();
+            pubsub_tx.send((topic, msgs))
+                .map_err(|e| dbg!(e))
+                .unwrap()
+            ;
         }
     });
 
@@ -235,12 +238,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    transformer_thread.join().unwrap();
-
     futures::future::join_all(vec!(
         publisher_task,
         log_pos_task
     )).await;
+
+    transformer_thread.join().unwrap();
 
     Ok(())
 }

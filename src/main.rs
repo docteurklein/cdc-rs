@@ -55,12 +55,13 @@ impl fmt::Display for ChangeType {
 }
 
 #[derive(Clone, Debug, Default)]
-struct Change {
+struct Change<T> {
+    log_pos: u32,
+    filename: String,
     db: String,
     table: String,
     op: ChangeType,
-    before: Option<BinlogRow>,
-    after: Option<BinlogRow>,
+    rows: Vec<T>,
     ts: u32,
 }
 
@@ -85,32 +86,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn mysql_changes(args: Args) -> impl Stream<Item = Result<(u32, String, Change)>> {
+fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> {
     try_stream! {
-        let (pos, mut filename) = setup_state(&args.state, args.server_id).unwrap();
-        dbg!(&pos, &filename);
+        let (mut log_pos, mut filename) = setup_state(&args.state, args.server_id)?;
+        dbg!(&log_pos, &filename);
 
         let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
         let mut binlog_stream = mysql.get_binlog_stream(BinlogStreamRequest::new(args.server_id)
-            .with_pos(pos as u64)
+            .with_pos(log_pos as u64)
             .with_filename(filename.as_bytes())
         ).await?;
 
         while let Some(Ok(event)) = binlog_stream.next().await {
-
             if let Some(e) = event.read_data()? {
                 match e {
                     EventData::RotateEvent(e) => {
+                        log_pos = event.header().log_pos() as i64;
                         filename = e.name().to_string();
                     }
                     EventData::RowsEvent(rows_event) => {
                         let tme = binlog_stream.get_tme(rows_event.table_id()).ok_or(anyhow!("no tme"))?;
                         let (db, table) = (tme.database_name().to_string(), tme.table_name().to_string());
 
-                        let re = Regex::new(&args.regex).unwrap();
+                        let re = Regex::new(&args.regex)?;
                         if ! re.is_match(&format!("{}.{}", db, table)) {
-                            // yield Err(());
-                            // continue;
+                            continue;
                         }
 
                         let change_type = match rows_event {
@@ -124,29 +124,28 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<(u32, String, Change)>
                             RowsEventData::WriteRowsEvent(_) |
                             RowsEventData::UpdateRowsEvent(_) |
                             RowsEventData::DeleteRowsEvent(_) => {
-                                for row in rows_event.clone().rows(tme) {
-                                     match row {
-                                        Ok((before, after)) => {
-
-                                            let ts = event.header().timestamp();
-
-                                            yield (
-                                                event.header().log_pos(),
-                                                filename.clone(),
-                                                Change {
-                                                    db: db.to_string(),
-                                                    table: table.to_string(),
-                                                    op: change_type.clone(),
-                                                    before,
-                                                    after,
-                                                    ts,
-                                                }
-                                            );
-                                        },
-                                        _ => panic!("{:?}", row)
-                                    }
+                                let new_pos = event.header().log_pos();
+                                if new_pos > 0 {
+                                    log_pos = new_pos as i64;
                                 }
-                            }
+
+                                yield Change {
+                                    db: db.to_string(),
+                                    table: table.to_string(),
+                                    op: change_type.clone(),
+                                    log_pos: log_pos as u32,
+                                    filename: filename.clone(),
+                                    ts: event.header().timestamp(),
+                                    rows: rows_event.clone().rows(tme)
+                                        .map(|row| {
+                                            match row {
+                                                Ok((before, after)) => (before, after),
+                                                _ => panic!("{:?}", row),
+                                            }
+                                        })
+                                    .collect(),
+                                };
+                            },
                             _ => {}
                         }
                     }
@@ -157,10 +156,10 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<(u32, String, Change)>
     }
 }
 
-fn transform<S: Stream<Item = Result<(u32, String, Change)>>>(args: Args, input: S)
-    -> impl Stream<Item = (u32, String, String, String)>
+fn transform<S: Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>>>(args: Args, input: S)
+    -> impl Stream<Item = Result<(String, Change<String>)>>
 {
-    stream! {
+    try_stream! {
         let rhai = Engine::new();
         let mut scope = Scope::new();
         let ast = args.script.map(|path| {
@@ -168,24 +167,27 @@ fn transform<S: Stream<Item = Result<(u32, String, Change)>>>(args: Args, input:
         }).unwrap().unwrap();
 
         for await change in input {
-            let (pos, filename, Change {db, table, op, before, after, ts}) = change.unwrap();
-            let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
-            let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
+            let  Change {log_pos, filename, db, table, op, rows, ts} = change?;
+            let rows = rows.iter().map(|(before, after)| {
+                let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
+                let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
 
-            let fields = rhai.call_fn::<rhai::Map>(
-                &mut scope,
-                &ast,
-                "transform",
-                (
-                    db.clone(),
-                    table.clone(),
-                    op.to_string(),
-                    before,
-                    after,
-                    ts
-                )
-            ).map_err(|e| dbg!(e))
-            .unwrap();
+                let fields = rhai.call_fn::<rhai::Map>(
+                    &mut scope,
+                    &ast,
+                    "transform",
+                    (
+                        db.clone(),
+                        table.clone(),
+                        op.to_string(),
+                        before,
+                        after,
+                        ts
+                    )
+                ).map_err(|e| dbg!(e))
+                .unwrap();
+                rhai::format_map_as_json(&fields)
+            }).collect();
 
             let topic = rhai
                 .call_fn::<String>(&mut scope, &ast, "topic", (db.to_string(), table.to_string(),))
@@ -194,17 +196,15 @@ fn transform<S: Stream<Item = Result<(u32, String, Change)>>>(args: Args, input:
             ;
 
             yield (
-                pos,
-                filename,
                 topic,
-                rhai::format_map_as_json(&fields)
+                Change { log_pos, filename, db, table, op, rows, ts }
             );
         }
     }
 }
 
-fn publish<S: Stream<Item = (u32, String, String, String)>>(input: S)
-    -> impl Stream<Item = Result<(u32, String)>>
+fn publish<S: Stream<Item = Result<(String, Change<String>)>>>(input: S)
+    -> impl Stream<Item = Result<Change<String>>>
 {
     try_stream! {
         let pubsub = Client::new(
@@ -213,39 +213,42 @@ fn publish<S: Stream<Item = (u32, String, String, String)>>(input: S)
 
         let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
 
-        for await (pos, filename, topic, data) in input {
-            let msg = PubsubMessage {
-                data: data.into(),
-                ..Default::default()
-            };
+        for await change in input {
+            let (topic, change) = change.unwrap();
+            let msgs = change.rows.iter().map(|data| {
+                PubsubMessage {
+                    data: data.to_string().into(),
+                    ..Default::default()
+                }
+            }).collect();
 
             let publisher = publishers.entry(topic.clone()).or_insert_with(|| {
                  dbg!(&topic);
                  pubsub.topic(&topic).new_publisher(None)
             });
 
-            // publisher.publish_immediately(vec!(msg), None).await?;
+            publisher.publish_immediately(msgs, None).await?;
 
-            yield (pos, filename);
+            yield change;
         }
     }
 }
-fn persist<S: Stream<Item = Result<(u32, String)>>>(args: Args, input: S)
+fn persist<S: Stream<Item = Result<Change<String>>>>(args: Args, input: S)
     -> impl Stream<Item = Result<()>>
 {
     try_stream! {
-        let connection = sqlite::open(&args.state).unwrap();
-        for await p in input {
-            let (pos, filename) = p?;
+        let connection = sqlite::open(&args.state)?;
+        for await change in input {
+            let change = change?;
             let mut statement = connection.prepare("
                 insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
                 on conflict do update set
                 pos = excluded.pos,
                 filename = excluded.filename
-            ").unwrap();
+            ")?;
             statement.bind((1, args.server_id as i64))?;
-            statement.bind((2, pos as i64))?;
-            statement.bind((3, filename.as_str()))?;
+            statement.bind((2, change.log_pos as i64))?;
+            statement.bind((3, change.filename.as_str()))?;
             statement.next()?;
             // dbg!((pos, filename));
 
@@ -266,7 +269,7 @@ fn setup_state(path: &String, server_id: u32) -> Result<(i64, String), Error> {
             sqlite::State::Row => Ok((statement.read::<i64, _>("pos").unwrap(), statement.read::<String, _>("filename").unwrap())),
             _ => sqlite::Result::Err(sqlite::Error { code: None, message: None }),
         }
-    }).unwrap_or((4, "".into()));
+    }).unwrap_or((4, "".into())); // 4 means first value :shrug:
 
     Ok((pos, filename))
 }

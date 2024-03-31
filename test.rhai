@@ -37,6 +37,6 @@ fn transform(db, table, op, before, after, ts) {
 }
 
 fn topic(db, table) {
-	`all_pims.${table}`
+	`projects/my-project-id/topics/all_pims.${table}`
 }
 

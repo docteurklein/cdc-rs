@@ -335,9 +335,11 @@ name = "cdc-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "clap",
  "futures",
  "futures-core",
+ "futures-util",
  "google-cloud-googleapis",
  "google-cloud-pubsub",
  "mysql_async",
@@ -345,6 +347,7 @@ dependencies = [
  "rhai",
  "sqlite",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

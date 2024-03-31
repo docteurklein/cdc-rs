@@ -27,13 +27,13 @@ fn bigquery(db, table, op, before, after) {
 		"Delete" => "DELETE",
 		_ => changeType,
 	};
-	print(fields);
 	fields
 }
 fn transform(db, table, op, before, after, ts) {
-	before.db = db;
-	after.db = db;
-	bigquery(db, table, op, before, after)
+	before.tenant = db;
+	after.tenant = db;
+	print(after);
+	debezium(db, table, op, before, after, ts)
 }
 
 fn topic(db, table) {

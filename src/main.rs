@@ -1,10 +1,16 @@
+use async_stream::stream;
+use async_stream::try_stream;
+use futures::stream::Stream;
+use futures::pin_mut;
+use futures::stream::StreamExt;
+
 use std::convert::identity;
 use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
 use mysql_async::binlog::events::*;
 use mysql_async::binlog::row::BinlogRow;
-use mysql_async::{Value, Row, Conn, Opts, BinlogStreamRequest};
+use mysql_async::{BinlogStreamRequest, Conn, Opts, Row, Value};
 use google_cloud_pubsub::client::{ClientConfig, Client};
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::publisher::Publisher;
@@ -12,12 +18,10 @@ use anyhow::{Error, Result};
 use regex::Regex;
 use clap::Parser;
 use rhai::{Dynamic, Engine, Scope};
-use tokio::sync::mpsc;
-use futures::{StreamExt};
 use anyhow::anyhow;
 use std::fmt;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Args {
     #[arg(short, long, env)]
     state: String,
@@ -35,8 +39,9 @@ struct Args {
     script: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 enum ChangeType {
+    #[default]
     Insert,
     Update,
     Delete,
@@ -49,12 +54,204 @@ impl fmt::Display for ChangeType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Change {
+    db: String,
+    table: String,
     op: ChangeType,
     before: Option<BinlogRow>,
     after: Option<BinlogRow>,
     ts: u32,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let s = persist(args.clone(),
+        publish(
+            transform(
+                args.clone(),
+                mysql_changes(args.clone()),
+            )
+        )
+    );
+    pin_mut!(s); // needed for iteration
+
+    while let Some(value) = s.next().await {
+        println!("got {:?}", value);
+    };
+
+    Ok(())
+}
+
+fn mysql_changes(args: Args) -> impl Stream<Item = Result<(u32, String, Change)>> {
+    try_stream! {
+        let (pos, mut filename) = setup_state(&args.state, args.server_id).unwrap();
+        dbg!(&pos, &filename);
+
+        let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
+        let mut binlog_stream = mysql.get_binlog_stream(BinlogStreamRequest::new(args.server_id)
+            .with_pos(pos as u64)
+            .with_filename(filename.as_bytes())
+        ).await?;
+
+        while let Some(Ok(event)) = binlog_stream.next().await {
+
+            if let Some(e) = event.read_data()? {
+                match e {
+                    EventData::RotateEvent(e) => {
+                        filename = e.name().to_string();
+                    }
+                    EventData::RowsEvent(rows_event) => {
+                        let tme = binlog_stream.get_tme(rows_event.table_id()).ok_or(anyhow!("no tme"))?;
+                        let (db, table) = (tme.database_name().to_string(), tme.table_name().to_string());
+
+                        let re = Regex::new(&args.regex).unwrap();
+                        if ! re.is_match(&format!("{}.{}", db, table)) {
+                            // yield Err(());
+                            // continue;
+                        }
+
+                        let change_type = match rows_event {
+                            RowsEventData::WriteRowsEvent(_) => ChangeType::Insert,
+                            RowsEventData::UpdateRowsEvent(_) => ChangeType::Update,
+                            RowsEventData::DeleteRowsEvent(_) => ChangeType::Delete,
+                            _ => ChangeType::Other,
+                        };
+
+                        match rows_event {
+                            RowsEventData::WriteRowsEvent(_) |
+                            RowsEventData::UpdateRowsEvent(_) |
+                            RowsEventData::DeleteRowsEvent(_) => {
+                                for row in rows_event.clone().rows(tme) {
+                                     match row {
+                                        Ok((before, after)) => {
+
+                                            let ts = event.header().timestamp();
+
+                                            yield (
+                                                event.header().log_pos(),
+                                                filename.clone(),
+                                                Change {
+                                                    db: db.to_string(),
+                                                    table: table.to_string(),
+                                                    op: change_type.clone(),
+                                                    before,
+                                                    after,
+                                                    ts,
+                                                }
+                                            );
+                                        },
+                                        _ => panic!("{:?}", row)
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn transform<S: Stream<Item = Result<(u32, String, Change)>>>(args: Args, input: S)
+    -> impl Stream<Item = (u32, String, String, String)>
+{
+    stream! {
+        let rhai = Engine::new();
+        let mut scope = Scope::new();
+        let ast = args.script.map(|path| {
+            rhai.compile_file_with_scope(&scope, path)
+        }).unwrap().unwrap();
+
+        for await change in input {
+            let (pos, filename, Change {db, table, op, before, after, ts}) = change.unwrap();
+            let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
+            let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
+
+            let fields = rhai.call_fn::<rhai::Map>(
+                &mut scope,
+                &ast,
+                "transform",
+                (
+                    db.clone(),
+                    table.clone(),
+                    op.to_string(),
+                    before,
+                    after,
+                    ts
+                )
+            ).map_err(|e| dbg!(e))
+            .unwrap();
+
+            let topic = rhai
+                .call_fn::<String>(&mut scope, &ast, "topic", (db.to_string(), table.to_string(),))
+                .map_err(|e| dbg!(e))
+                .unwrap_or(table.to_string())
+            ;
+
+            yield (
+                pos,
+                filename,
+                topic,
+                rhai::format_map_as_json(&fields)
+            );
+        }
+    }
+}
+
+fn publish<S: Stream<Item = (u32, String, String, String)>>(input: S)
+    -> impl Stream<Item = Result<(u32, String)>>
+{
+    try_stream! {
+        let pubsub = Client::new(
+            ClientConfig::default().with_auth().await?
+        ).await?;
+
+        let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
+
+        for await (pos, filename, topic, data) in input {
+            let msg = PubsubMessage {
+                data: data.into(),
+                ..Default::default()
+            };
+
+            let publisher = publishers.entry(topic.clone()).or_insert_with(|| {
+                 dbg!(&topic);
+                 pubsub.topic(&topic).new_publisher(None)
+            });
+
+            // publisher.publish_immediately(vec!(msg), None).await?;
+
+            yield (pos, filename);
+        }
+    }
+}
+fn persist<S: Stream<Item = Result<(u32, String)>>>(args: Args, input: S)
+    -> impl Stream<Item = Result<()>>
+{
+    try_stream! {
+        let connection = sqlite::open(&args.state).unwrap();
+        for await p in input {
+            let (pos, filename) = p?;
+            let mut statement = connection.prepare("
+                insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
+                on conflict do update set
+                pos = excluded.pos,
+                filename = excluded.filename
+            ").unwrap();
+            statement.bind((1, args.server_id as i64))?;
+            statement.bind((2, pos as i64))?;
+            statement.bind((3, filename.as_str()))?;
+            statement.next()?;
+            // dbg!((pos, filename));
+
+            yield ();
+        }
+    }
 }
 
 fn setup_state(path: &String, server_id: u32) -> Result<(i64, String), Error> {
@@ -74,180 +271,6 @@ fn setup_state(path: &String, server_id: u32) -> Result<(i64, String), Error> {
     Ok((pos, filename))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Args::parse();
-
-    let (log_pos_tx, mut log_pos_rx) = mpsc::unbounded_channel::<(i64, String)>();
-
-    let (pos, mut filename) = setup_state(&cli.state, cli.server_id)?;
-    dbg!(&pos, &filename);
-
-    let log_pos_task = tokio::spawn(async move {
-        let connection = sqlite::open(&cli.state.clone()).unwrap();
-        while let Some((pos, filename)) = log_pos_rx.recv().await {
-            let mut statement = connection.prepare("
-                insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
-                on conflict do update set
-                pos = excluded.pos,
-                filename = excluded.filename
-            ").unwrap();
-            statement.bind((1, cli.server_id as i64))?;
-            statement.bind((2, pos))?;
-            statement.bind((3, filename.as_str()))?;
-            statement.next()?;
-            // dbg!((pos, filename));
-        }
-        Ok::<(), Error>(())
-    });
-
-    let (pubsub_tx, mut pubsub_rx) = mpsc::unbounded_channel::<(String, Vec<String>)>();
-
-    let (transform_tx, transform_rx) = std::sync::mpsc::channel::<(String, String, Vec<Change>)>();
-
-    let transformer_thread = std::thread::spawn(move || {
-        let rhai = Engine::new();
-        let mut scope = Scope::new();
-        let ast = cli.script.map(|path| {
-            rhai.compile_file_with_scope(&scope, path)
-        }).unwrap().unwrap();
-
-        while let Ok((db, table, changes)) = transform_rx.recv() {
-            let msgs = changes.into_iter().map(|Change {op, before, after, ts}| {
-
-                let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
-                let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
-
-                let fields = rhai.call_fn::<rhai::Map>(
-                    &mut scope,
-                    &ast,
-                    "transform",
-                    (
-                        db.clone(),
-                        table.clone(),
-                        op.to_string(),
-                        before,
-                        after,
-                        ts
-                    )
-                ).map_err(|e| dbg!(e))
-                .unwrap();
-
-                rhai::format_map_as_json(&fields)
-            }).collect();
-
-            let topic = rhai
-                .call_fn::<String>(&mut scope, &ast, "topic", (db.to_string(), table.to_string(),))
-                .map_err(|e| dbg!(e))
-                .unwrap_or(table.to_string())
-            ;
-
-            pubsub_tx.send((topic, msgs))
-                .map_err(|e| dbg!(e))
-                .unwrap()
-            ;
-        }
-    });
-
-    let publisher_task = tokio::spawn(async move {
-        let pubsub = Client::new(
-            ClientConfig::default().with_auth().await?
-        ).await?;
-
-        let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
-
-        while let Some((topic, msgs)) = pubsub_rx.recv().await {
-            let msgs = msgs.iter().map(|data| {
-                PubsubMessage {
-                    data: data.to_string().into(),
-                    ..Default::default()
-                }
-            }).collect();
-
-            let publisher = publishers.entry(topic.clone()).or_insert_with(|| {
-                 dbg!(&topic);
-                 pubsub.topic(&topic).new_publisher(None)
-            });
-
-            publisher.publish_immediately(msgs, None).await?;
-        };
-        Ok::<(), Error>(())
-    });
-
-    let mysql = Conn::new(Opts::from_url(&cli.source)?).await?;
-    let mut binlog_stream = mysql.get_binlog_stream(BinlogStreamRequest::new(cli.server_id)
-        .with_pos(pos as u64)
-        .with_filename(filename.as_bytes())
-    ).await?;
-
-    while let Some(event) = binlog_stream.next().await {
-        let event = event.unwrap();
-
-        if let Some(e) = event.read_data()? {
-            match e {
-                EventData::RotateEvent(e) => {
-                    filename = e.name().to_string();
-                }
-                EventData::RowsEvent(rows_event) => {
-                    let tme = binlog_stream.get_tme(rows_event.table_id()).ok_or(anyhow!("no tme"))?;
-                    let (db, table) = (tme.database_name().to_string(), tme.table_name().to_string());
-
-                    let re = Regex::new(&cli.regex).unwrap();
-                    if ! re.is_match(&format!("{}.{}", db, table)) {
-                        continue;
-                    }
-
-                    let change_type = match rows_event {
-                        RowsEventData::WriteRowsEvent(_) => ChangeType::Insert,
-                        RowsEventData::UpdateRowsEvent(_) => ChangeType::Update,
-                        RowsEventData::DeleteRowsEvent(_) => ChangeType::Delete,
-                        _ => ChangeType::Other,
-                    };
-
-                    match rows_event {
-                        RowsEventData::WriteRowsEvent(_) |
-                        RowsEventData::UpdateRowsEvent(_) |
-                        RowsEventData::DeleteRowsEvent(_) => {
-                            let changes: Vec<Change> = rows_event.clone().rows(tme).map(|row| {
-                                 match row {
-                                    Ok((before, after)) => {
-
-                                        let ts = event.header().timestamp();
-
-                                        Change {
-                                            op: change_type.clone(),
-                                            before,
-                                            after,
-                                            ts,
-                                        }
-                                    },
-                                    _ => panic!("{:?}", row)
-                                }
-                            }).collect();
-
-                            transform_tx.send((db.to_string(), table.to_string(), changes))?;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-            if event.header().log_pos() > 0 {
-                log_pos_tx.send((event.header().log_pos() as i64, filename.clone()))?;
-            }
-        }
-    }
-
-    futures::future::join_all(vec!(
-        publisher_task,
-        log_pos_task
-    )).await;
-
-    transformer_thread.join().unwrap();
-
-    Ok(())
-}
-
 fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {
     let cols: Vec<String> = row_image.columns_ref().iter().map(|c| {
         c.name_str().to_string()
@@ -260,11 +283,10 @@ fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {
         .map(|(i, mv)| {
             let k = cols.get(i).unwrap();
             let v = match mv {
-                Value::NULL => Dynamic::from(()),
                 Value::Bytes(ref bytes) => match from_utf8(bytes) {
                     Ok(v) => Dynamic::from(v.to_string()),
                     Err(_) => {
-                        let mut s = String::from("0x");
+                        let mut s = String::new();
                         for c in bytes.iter() {
                             s.extend(format!("{:02X}", *c).chars())
                         }
@@ -277,7 +299,8 @@ fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {
                 Value::Double(v) => Dynamic::from(*v),
                 // mysql::Value::Date(v) => Dynamic::from(v),
                 // mysql::Value::Time(v) => Dynamic::from(v),
-                _ => Dynamic::from("NOPE"),
+                // Value::NULL => Dynamic::from(()),
+                _ => Dynamic::from(()),
             };
             (k.into(), v)
         })

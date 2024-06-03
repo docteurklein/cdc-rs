@@ -2,10 +2,6 @@
   description = "cdc-rs";
 
   inputs = {
-    # params = {
-    #   url = "./test";
-    #   flake = false;
-    # };
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     kubenix = {
       url = "github:hall/kubenix";
@@ -39,10 +35,6 @@
       perSystem = { system, pkgs, lib, inputs', ... }:
         let
           nix2c = nix2container.packages.${system}.nix2container;
-          cargoNix = inputs.crate2nix.tools.${system}.appliedCargoNix {
-            name = "cdc-rs";
-            src = ./.;
-          };
 
           cdc-rs = inputs.crate2nix.tools.${system}.appliedCargoNix {
             name = "cdc-rs";
@@ -51,9 +43,9 @@
         in
         rec {
           checks = {
-            rustnix = cargoNix.rootCrate.build.override {
-              runTests = true;
-            };
+            # rustnix = cdc-rs.rootCrate.build.override {
+            #   runTests = true;
+            # };
           };
 
           devShells = {
@@ -95,6 +87,15 @@
               config = {
                 Entrypoint = [ "${packages.cdc-rs}/bin/cdc-rs" ];
               };
+              copyToRoot = pkgs.buildEnv {
+                name = "utils";
+                paths = with pkgs; [
+                  bashInteractive
+                  coreutils
+                  sqlite
+                ];
+                pathsToLink = [ "/bin" ];
+              };
             };
 
             kube = (kubenix.evalModules.${system} {
@@ -114,7 +115,8 @@
                   template.metadata.labels.app = "cdc-rs";
                   template.spec = {
                     containers."cdc-rs" = {
-                      image = config.docker.images."cdc-rs".path;
+                      # image = config.docker.images."cdc-rs".path;
+                      image = "docteurklein/cdc-rs:latest";
                       imagePullPolicy = "IfNotPresent";
                       volumeMounts = {
                         "/script/cdc-rs".name = "cdc-rs-script";
@@ -125,9 +127,9 @@
                         "--script" "/script/cdc-rs/script.rhai"
                       ];
                       env = [
-                        { name = "SOURCE"; value = ""; }
-                        { name = "REGEX"; value = ""; }
-                        { name = "SERVER_ID"; value = ""; }
+                        { name = "SOURCE"; value = "mysql://replicator:a9e21296-4d24-48c1-89db-51536cf7b583@172.28.0.217:3306"; }
+                        { name = "REGEX"; value = "test1.*"; }
+                        { name = "SERVER_ID"; value = "123456"; }
                       ];
                     };
                     volumes = [

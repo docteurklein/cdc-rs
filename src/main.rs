@@ -1,8 +1,10 @@
 use async_stream::stream;
 use async_stream::try_stream;
 use futures::stream::Stream;
+use futures::sink::{self, SinkExt};
 use futures::pin_mut;
 use futures::stream::StreamExt;
+use rhai::AST;
 
 use std::convert::identity;
 use std::path::PathBuf;
@@ -67,29 +69,31 @@ struct Change<T> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // let subscriber = tracing_subscriber::FmtSubscriber::new();
+    // tracing::subscriber::set_global_default(subscriber)?;
+    // console_subscriber::init();
+
     let args = Args::parse();
 
-    let s = persist(args.clone(),
-        publish(
-            transform(
-                args.clone(),
-                mysql_changes(args.clone()),
-            )
-        )
-    );
+    let dsl = DSL::new(args.clone().script);
+    let dsl2 = DSL::new(args.clone().script);
+
+    let s = persist(args.clone(), publish(transform(dsl, args.clone(), mysql_changes(dsl2, args.clone()))));
     pin_mut!(s); // needed for iteration
 
     while let Some(value) = s.next().await {
-        println!("got {:?}", value);
+        dbg!(&value);
     };
 
     Ok(())
 }
 
-fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> {
+fn mysql_changes(dsl: DSL, args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> {
     try_stream! {
         let (mut log_pos, mut filename) = setup_state(&args.state, args.server_id)?;
         dbg!(&log_pos, &filename);
+
+        let re = Regex::new(&args.regex)?;
 
         let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
         let mut binlog_stream = mysql.get_binlog_stream(BinlogStreamRequest::new(args.server_id)
@@ -108,7 +112,6 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogR
                         let tme = binlog_stream.get_tme(rows_event.table_id()).ok_or(anyhow!("no tme"))?;
                         let (db, table) = (tme.database_name().to_string(), tme.table_name().to_string());
 
-                        let re = Regex::new(&args.regex)?;
                         if ! re.is_match(&format!("{}.{}", db, table)) {
                             continue;
                         }
@@ -156,44 +159,75 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogR
     }
 }
 
-fn transform<S: Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>>>(args: Args, input: S)
-    -> impl Stream<Item = Result<(String, Change<String>)>>
-{
-    try_stream! {
+struct DSL<'a> {
+    rhai: Engine,
+    ast: AST,
+    scope: Scope<'a>,
+}
+
+impl DSL<'_> {
+    fn new<'a>(script: Option<PathBuf>) -> Self {
         let rhai = Engine::new();
-        let mut scope = Scope::new();
-        let ast = args.script.map(|path| {
+        let scope = Scope::new();
+        let ast = script.map(|path| {
             rhai.compile_file_with_scope(&scope, path)
         }).unwrap().unwrap();
 
+        DSL {rhai, ast, scope}
+    }
+
+    fn transform(&mut self, db: String, table: String, op: ChangeType, before: rhai::Map, after: rhai::Map, ts: u32) -> String {
+        let fields = self.rhai.call_fn::<rhai::Map>(
+            &mut self.scope,
+            &self.ast,
+            "transform",
+            (
+                db.clone(),
+                table.clone(),
+                op.to_string(),
+                before,
+                after,
+                ts
+            )
+        ).map_err(|e| dbg!(e)).unwrap();
+
+        rhai::format_map_as_json(&fields)
+    }
+
+    fn topic(&mut self, db: String, table: String) -> String {
+        self.rhai.call_fn::<String>(
+            &mut self.scope,
+            &self.ast,
+            "topic",
+            (
+                db.clone(),
+                table.clone()
+            )
+        ).map_err(|e| dbg!(e)).unwrap()
+    }
+}
+
+fn transform<'a, S: Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> + 'a>(mut dsl: DSL<'a>, args: Args, input: S)
+    -> impl Stream<Item = Result<(String, Change<String>)>> + 'a
+{
+    try_stream! {
         for await change in input {
             let  Change {log_pos, filename, db, table, op, rows, ts} = change?;
             let rows = rows.iter().map(|(before, after)| {
                 let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
                 let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
 
-                let fields = rhai.call_fn::<rhai::Map>(
-                    &mut scope,
-                    &ast,
-                    "transform",
-                    (
-                        db.clone(),
-                        table.clone(),
-                        op.to_string(),
-                        before,
-                        after,
-                        ts
-                    )
-                ).map_err(|e| dbg!(e))
-                .unwrap();
-                rhai::format_map_as_json(&fields)
+                dsl.transform(
+                    db.clone(),
+                    table.clone(),
+                    op.clone(),
+                    before,
+                    after,
+                    ts
+                )
             }).collect();
 
-            let topic = rhai
-                .call_fn::<String>(&mut scope, &ast, "topic", (db.to_string(), table.to_string(),))
-                .map_err(|e| dbg!(e))
-                .unwrap_or(table.to_string())
-            ;
+            let topic = dsl.topic(db.clone(), table.clone());
 
             yield (
                 topic,
@@ -214,8 +248,8 @@ fn publish<S: Stream<Item = Result<(String, Change<String>)>>>(input: S)
         let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
 
         for await change in input {
-            let (topic, change) = change.unwrap();
-            let msgs = change.rows.iter().map(|data| {
+            let (topic, change) = change?;
+            let msgs: Vec<PubsubMessage> = change.rows.iter().map(|data| {
                 PubsubMessage {
                     data: data.to_string().into(),
                     ..Default::default()
@@ -227,12 +261,13 @@ fn publish<S: Stream<Item = Result<(String, Change<String>)>>>(input: S)
                  pubsub.topic(&topic).new_publisher(None)
             });
 
-            publisher.publish_immediately(msgs, None).await?;
+            // publisher.publish_immediately(msgs, None).await?;
 
             yield change;
         }
     }
 }
+
 fn persist<S: Stream<Item = Result<Change<String>>>>(args: Args, input: S)
     -> impl Stream<Item = Result<()>>
 {
@@ -286,6 +321,45 @@ fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {
         .map(|(i, mv)| {
             let k = cols.get(i).unwrap();
             let v = match mv {
+                Value::Int(v) => Dynamic::from(*v),
+                Value::UInt(v) => Dynamic::from(*v),
+                Value::Float(v) => Dynamic::from(*v),
+                Value::Double(v) => Dynamic::from(*v),
+                Value::Date(y, m, d, 0, 0, 0, 0) => Dynamic::from(format!("{:04}-{:02}-{:02}", y, m, d)),
+                Value::Date(year, month, day, hour, minute, second, 0) => Dynamic::from(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    year, month, day, hour, minute, second
+                )),
+                Value::Date(year, month, day, hour, minute, second, micros) => Dynamic::from(format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                    year, month, day, hour, minute, second, micros
+                )),
+                Value::Time(neg, d, h, i, s, 0) => {
+                    Dynamic::from(if neg.clone() {
+                        format!("-{:03}:{:02}:{:02}", d * 24 + u32::from(h.clone()), i, s)
+                    } else {
+                        format!("{:03}:{:02}:{:02}", d * 24 + u32::from(h.clone()), i, s)
+                    })
+                }
+                Value::Time(neg, days, hours, minutes, seconds, micros) => {
+                    Dynamic::from(if neg.clone() {
+                        format!(
+                            "-{:03}:{:02}:{:02}.{:06}",
+                            days * 24 + u32::from(hours.clone()),
+                            minutes,
+                            seconds,
+                            micros
+                        )
+                    } else {
+                        format!(
+                            "{:03}:{:02}:{:02}.{:06}",
+                            days * 24 + u32::from(hours.clone()),
+                            minutes,
+                            seconds,
+                            micros
+                        )
+                    })
+                },
                 Value::Bytes(ref bytes) => match from_utf8(bytes) {
                     Ok(v) => Dynamic::from(v.to_string()),
                     Err(_) => {
@@ -296,14 +370,7 @@ fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {
                         Dynamic::from(s)
                     },
                 }
-                Value::Int(v) => Dynamic::from(*v),
-                Value::UInt(v) => Dynamic::from(*v),
-                Value::Float(v) => Dynamic::from(*v),
-                Value::Double(v) => Dynamic::from(*v),
-                // mysql::Value::Date(v) => Dynamic::from(v),
-                // mysql::Value::Time(v) => Dynamic::from(v),
-                // Value::NULL => Dynamic::from(()),
-                _ => Dynamic::from(()),
+                Value::NULL => Dynamic::from(()),
             };
             (k.into(), v)
         })

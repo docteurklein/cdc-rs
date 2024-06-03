@@ -6,7 +6,7 @@ Replication position state is stored client-side using a disk-based sqlite db fo
 # why?
 
 Because debezium is bad to tweak.  
-Instead of using debezium SingleMessageTransformers, this instead uses an embedded scripting language (rhai) to transfom messages and destination topics.
+Instead of using debezium SingleMessageTransformers, this instead uses the rhai.rs embedded scripting language to transfom messages and destination topics.
 
 This enables easier CDC use-cases, for example: mysql -> cdc-rs -> pubsub topic -> bigquery subscription -> CDC-enabled bigquery table.
 
@@ -47,17 +47,16 @@ cdc-rs \
 Where `script.rhai` contains:
 
 ```
-fn debezium(db, table, changeType, before, after) {
-	let ts = timestamp();
+fn debezium(db, table, op, before, after, ts) {
 	#{
 		payload: #{
 			before: before,
 			after: after,
-			op: switch changeType {
+			op: switch op {
 				"INSERT" => "c",
 				"UPDATE" => "u",
 				"DELETE" => "d",
-				_ => changeType,
+				_ => op,
 			},
 			source: #{
 				ts_ms: `${ts}`,

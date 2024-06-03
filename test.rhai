@@ -19,7 +19,7 @@ fn debezium(db, table, op, before, after, ts) {
 	}
 }
 
-fn bigquery(db, table, op, before, after) {
+fn bigquery(db, table, op, before, after, ts) {
 	let fields = if op == "Delete" { before } else { after };
 	fields._CHANGE_TYPE = switch op {
 		"Insert" => "UPSERT",
@@ -30,10 +30,13 @@ fn bigquery(db, table, op, before, after) {
 	fields
 }
 fn transform(db, table, op, before, after, ts) {
-	before.tenant = db;
-	after.tenant = db;
-	print(after);
-	debezium(db, table, op, before, after, ts)
+	// before.tenant = db;
+	// after.tenant = db;
+	let res = bigquery(db, table, op, before, after, ts);
+	res.tenant = db;
+	print(res);
+	print(`${db}.${table}`);
+	res
 }
 
 fn topic(db, table) {

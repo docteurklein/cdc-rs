@@ -1,4 +1,3 @@
-use async_stream::stream;
 use async_stream::try_stream;
 use futures::stream::Stream;
 use futures::sink::{self, SinkExt};
@@ -75,20 +74,64 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let dsl = DSL::new(args.clone().script);
-    let dsl2 = DSL::new(args.clone().script);
+    let mut dsl = DSL::new(args.clone().script);
 
-    let s = persist(args.clone(), publish(transform(dsl, args.clone(), mysql_changes(dsl2, args.clone()))));
+    let s = mysql_changes(args.clone());
     pin_mut!(s); // needed for iteration
 
-    while let Some(value) = s.next().await {
-        dbg!(&value);
-    };
+    let pubsub = Client::new(
+        ClientConfig::default().with_auth().await?
+    ).await?;
+
+    let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
+
+    let connection = sqlite::open(&args.state)?;
+
+    while let Some(change) = s.next().await {
+        let Change {log_pos, filename, db, table, op, rows, ts} = change?;
+        let msgs: Vec<PubsubMessage> = rows.iter().map(|(before, after)| {
+            let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
+            let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
+
+            let data = dsl.transform(
+                db.clone(),
+                table.clone(),
+                op.clone(),
+                before,
+                after,
+                ts
+            );
+            PubsubMessage {
+                data: data.to_string().into(),
+                ..Default::default()
+            }
+        }).collect();
+
+        let topic = dsl.topic(db.clone(), table.clone());
+
+        let publisher = publishers.entry(topic.clone()).or_insert_with(|| {
+             dbg!(&topic);
+             pubsub.topic(&topic).new_publisher(None)
+        });
+
+        // publisher.publish_immediately(msgs, None).await?;
+
+        let mut statement = connection.prepare("
+            insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
+            on conflict do update set
+            pos = excluded.pos,
+            filename = excluded.filename
+        ")?;
+        statement.bind((1, args.server_id as i64))?;
+        statement.bind((2, log_pos as i64))?;
+        statement.bind((3, filename.as_str()))?;
+        statement.next()?;
+    }
 
     Ok(())
 }
 
-fn mysql_changes(dsl: DSL, args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> {
+fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> {
     try_stream! {
         let (mut log_pos, mut filename) = setup_state(&args.state, args.server_id)?;
         dbg!(&log_pos, &filename);
@@ -204,91 +247,6 @@ impl DSL<'_> {
                 table.clone()
             )
         ).map_err(|e| dbg!(e)).unwrap()
-    }
-}
-
-fn transform<'a, S: Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> + 'a>(mut dsl: DSL<'a>, args: Args, input: S)
-    -> impl Stream<Item = Result<(String, Change<String>)>> + 'a
-{
-    try_stream! {
-        for await change in input {
-            let  Change {log_pos, filename, db, table, op, rows, ts} = change?;
-            let rows = rows.iter().map(|(before, after)| {
-                let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
-                let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
-
-                dsl.transform(
-                    db.clone(),
-                    table.clone(),
-                    op.clone(),
-                    before,
-                    after,
-                    ts
-                )
-            }).collect();
-
-            let topic = dsl.topic(db.clone(), table.clone());
-
-            yield (
-                topic,
-                Change { log_pos, filename, db, table, op, rows, ts }
-            );
-        }
-    }
-}
-
-fn publish<S: Stream<Item = Result<(String, Change<String>)>>>(input: S)
-    -> impl Stream<Item = Result<Change<String>>>
-{
-    try_stream! {
-        let pubsub = Client::new(
-            ClientConfig::default().with_auth().await?
-        ).await?;
-
-        let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
-
-        for await change in input {
-            let (topic, change) = change?;
-            let msgs: Vec<PubsubMessage> = change.rows.iter().map(|data| {
-                PubsubMessage {
-                    data: data.to_string().into(),
-                    ..Default::default()
-                }
-            }).collect();
-
-            let publisher = publishers.entry(topic.clone()).or_insert_with(|| {
-                 dbg!(&topic);
-                 pubsub.topic(&topic).new_publisher(None)
-            });
-
-            // publisher.publish_immediately(msgs, None).await?;
-
-            yield change;
-        }
-    }
-}
-
-fn persist<S: Stream<Item = Result<Change<String>>>>(args: Args, input: S)
-    -> impl Stream<Item = Result<()>>
-{
-    try_stream! {
-        let connection = sqlite::open(&args.state)?;
-        for await change in input {
-            let change = change?;
-            let mut statement = connection.prepare("
-                insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
-                on conflict do update set
-                pos = excluded.pos,
-                filename = excluded.filename
-            ")?;
-            statement.bind((1, args.server_id as i64))?;
-            statement.bind((2, change.log_pos as i64))?;
-            statement.bind((3, change.filename.as_str()))?;
-            statement.next()?;
-            // dbg!((pos, filename));
-
-            yield ();
-        }
     }
 }
 

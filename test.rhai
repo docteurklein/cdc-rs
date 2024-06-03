@@ -1,4 +1,6 @@
 fn debezium(db, table, op, before, after, ts) {
+	before.tenant = db;
+	after.tenant = db;
 	#{
 		payload: #{
 			before: before,
@@ -27,13 +29,11 @@ fn bigquery(db, table, op, before, after, ts) {
 		"Delete" => "DELETE",
 		_ => changeType,
 	};
+	fields.tenant = db;
 	fields
 }
 fn transform(db, table, op, before, after, ts) {
-	// before.tenant = db;
-	// after.tenant = db;
 	let res = bigquery(db, table, op, before, after, ts);
-	res.tenant = db;
 	print(res);
 	print(`${db}.${table}`);
 	res

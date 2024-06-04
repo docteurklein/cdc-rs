@@ -1,14 +1,16 @@
 use async_stream::try_stream;
 use futures::stream::Stream;
-use futures::sink::{self, SinkExt};
 use futures::pin_mut;
 use futures::stream::StreamExt;
+use mysql_async::FromRowError;
 use rhai::AST;
 
 use std::convert::identity;
 use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
+use mysql_async::prelude::*;
+use mysql_async::QueryWithParams;
 use mysql_async::binlog::events::*;
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::{BinlogStreamRequest, Conn, Opts, Row, Value};
@@ -46,6 +48,7 @@ enum ChangeType {
     Insert,
     Update,
     Delete,
+    Backfill,
     Other,
 }
 
@@ -76,9 +79,6 @@ async fn main() -> Result<()> {
 
     let mut dsl = DSL::new(args.clone().script);
 
-    let s = mysql_changes(args.clone());
-    pin_mut!(s); // needed for iteration
-
     let pubsub = Client::new(
         ClientConfig::default().with_auth().await?
     ).await?;
@@ -87,18 +87,19 @@ async fn main() -> Result<()> {
 
     let connection = sqlite::open(&args.state)?;
 
+    let s = mysql_changes(args.clone());
+    pin_mut!(s); // needed for iteration
+
     while let Some(change) = s.next().await {
         let Change {log_pos, filename, db, table, op, rows, ts} = change?;
         let msgs: Vec<PubsubMessage> = rows.iter().map(|(before, after)| {
-            let before = before.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
-            let after = after.clone().map(row_image_to_map).map_or(BTreeMap::new(), identity);
 
             let data = dsl.transform(
                 db.clone(),
                 table.clone(),
                 op.clone(),
-                before,
-                after,
+                before.clone(),
+                after.clone(),
                 ts
             );
             PubsubMessage {
@@ -131,14 +132,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogRow>, Option<BinlogRow>)>>> {
+#[derive(Debug, Clone)]
+struct RawRow(Row);
+
+impl FromRow for RawRow {
+    fn from_row_opt(row: Row) -> Result<Self, FromRowError> {
+        Ok(Self(row))
+    }
+}
+
+fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::Map>, Option<rhai::Map>)>>> {
     try_stream! {
         let (mut log_pos, mut filename) = setup_state(&args.state, args.server_id)?;
         dbg!(&log_pos, &filename);
 
         let re = Regex::new(&args.regex)?;
 
-        let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
+        let mut mysql = Conn::new(Opts::from_url(&args.source)?).await?;
+
         let mut binlog_stream = mysql.get_binlog_stream(BinlogStreamRequest::new(args.server_id)
             .with_pos(log_pos as u64)
             .with_filename(filename.as_bytes())
@@ -157,6 +168,34 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogR
 
                         if ! re.is_match(&format!("{}.{}", db, table)) {
                             continue;
+                        }
+
+                        // @TODO yield backfill
+                        let mut mysql2 = Conn::new(Opts::from_url(&args.source)?).await?;
+                        loop {
+                            let page: Vec<RawRow> = //mysql2.query(
+                                format!("select * from {}.{} where {} > 1 limit {}", db, table, "id", 1000)
+                                .fetch(mysql2)
+                            .await?;
+
+                            dbg!(&page);
+                            yield Change {
+                                db: db.to_string(),
+                                table: table.to_string(),
+                                op: ChangeType::Backfill,
+                                log_pos: log_pos as u32,
+                                filename: filename.clone(),
+                                ts: 1, // @TODO
+                                rows: page.iter()
+                                    .map(|row| {
+                                        (
+                                            None,
+                                            Some(row_to_map(row.0.clone())),
+                                        )
+                                    })
+                                .collect(),
+                            };
+                            break;
                         }
 
                         let change_type = match rows_event {
@@ -185,7 +224,10 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<BinlogR
                                     rows: rows_event.clone().rows(tme)
                                         .map(|row| {
                                             match row {
-                                                Ok((before, after)) => (before, after),
+                                                Ok((before, after)) => (
+                                                    before.map(Row::try_from).map(Result::unwrap).map(row_to_map),
+                                                    after.map(Row::try_from).map(Result::unwrap).map(row_to_map),
+                                                ),
                                                 _ => panic!("{:?}", row),
                                             }
                                         })
@@ -219,7 +261,7 @@ impl DSL<'_> {
         DSL {rhai, ast, scope}
     }
 
-    fn transform(&mut self, db: String, table: String, op: ChangeType, before: rhai::Map, after: rhai::Map, ts: u32) -> String {
+    fn transform(&mut self, db: String, table: String, op: ChangeType, before: Option<rhai::Map>, after: Option<rhai::Map>, ts: u32) -> String {
         let fields = self.rhai.call_fn::<rhai::Map>(
             &mut self.scope,
             &self.ast,
@@ -228,8 +270,8 @@ impl DSL<'_> {
                 db.clone(),
                 table.clone(),
                 op.to_string(),
-                before,
-                after,
+                before.map_or(Dynamic::from(()), Dynamic::from), // either pass the map to dynamic::from, or pass Unit
+                after.map_or(Dynamic::from(()), Dynamic::from),
                 ts
             )
         ).map_err(|e| dbg!(e)).unwrap();
@@ -267,12 +309,12 @@ fn setup_state(path: &String, server_id: u32) -> Result<(i64, String), Error> {
     Ok((pos, filename))
 }
 
-fn row_image_to_map(row_image: BinlogRow) -> rhai::Map {
-    let cols: Vec<String> = row_image.columns_ref().iter().map(|c| {
+fn row_to_map(row: Row) -> rhai::Map {
+    let cols: Vec<String> = row.columns_ref().iter().map(|c| {
         c.name_str().to_string()
     }).collect();
 
-    let fields: rhai::Map = Row::try_from(row_image).unwrap()
+    let fields: rhai::Map = row
         .unwrap() // as Vec
         .iter()
         .enumerate()

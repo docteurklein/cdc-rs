@@ -12,7 +12,8 @@ anyhow = "1.0.79"
 google-cloud-googleapis = "0.12.0"
 futures = "0.3.30"
 regex = "1.10.3"
-sqlite = "0.33.0"
+tokio-rusqlite = "0.5.1"
+fallible-iterator = "0.3"
 clap = { version = "4.4.18", features = ["derive", "env"] }
 rhai = { version = "1.17.1", features = ["default", "sync"] }
 mysql_async = "0.33.0"

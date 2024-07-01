@@ -1,18 +1,15 @@
+use fallible_iterator::FallibleIterator;
 use async_stream::try_stream;
-use futures::stream::Stream;
+use tokio_rusqlite::{params, Connection, Transaction, TransactionBehavior, OptionalExtension};
 use futures::pin_mut;
-use futures::stream::StreamExt;
+use tokio_stream::{StreamExt, Stream};
 use mysql_async::FromRowError;
 use rhai::AST;
-
-use std::convert::identity;
 use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::str::from_utf8;
 use mysql_async::prelude::*;
-use mysql_async::QueryWithParams;
 use mysql_async::binlog::events::*;
-use mysql_async::binlog::row::BinlogRow;
 use mysql_async::{BinlogStreamRequest, Conn, Opts, Row, Value};
 use google_cloud_pubsub::client::{ClientConfig, Client};
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
@@ -49,7 +46,6 @@ enum ChangeType {
     Update,
     Delete,
     Backfill,
-    Other,
 }
 
 impl fmt::Display for ChangeType {
@@ -77,6 +73,10 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    let sqlite = Connection::open(&args.state).await?;
+
+    let (log_pos, filename) = setup_state(sqlite.clone(), args.server_id).await?.unwrap();
+
     let mut dsl = DSL::new(args.clone().script);
 
     let pubsub = Client::new(
@@ -85,12 +85,15 @@ async fn main() -> Result<()> {
 
     let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
 
-    let connection = sqlite::open(&args.state)?;
+    let changes = mysql_changes(sqlite.clone(), log_pos, filename, args.clone());
+    pin_mut!(changes); // needed for iteration
 
-    let s = mysql_changes(args.clone());
-    pin_mut!(s); // needed for iteration
+    let backfill = backfill(sqlite.clone(), args.clone());
+    pin_mut!(backfill); // needed for iteration
 
-    while let Some(change) = s.next().await {
+    let mut both = changes.merge(backfill);
+
+    while let Some(change) = both.next().await {
         let Change {log_pos, filename, db, table, op, rows, ts} = change?;
         let msgs: Vec<PubsubMessage> = rows.iter().map(|(before, after)| {
 
@@ -116,17 +119,6 @@ async fn main() -> Result<()> {
         });
 
         // publisher.publish_immediately(msgs, None).await?;
-
-        let mut statement = connection.prepare("
-            insert into log_pos (server_id, pos, filename) values (?, max(4, ?), ?)
-            on conflict do update set
-            pos = excluded.pos,
-            filename = excluded.filename
-        ")?;
-        statement.bind((1, args.server_id as i64))?;
-        statement.bind((2, log_pos as i64))?;
-        statement.bind((3, filename.as_str()))?;
-        statement.next()?;
     }
 
     Ok(())
@@ -141,14 +133,13 @@ impl FromRow for RawRow {
     }
 }
 
-fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::Map>, Option<rhai::Map>)>>> {
+fn mysql_changes(sqlite: Connection, mut log_pos: i64, mut filename: String, args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::Map>, Option<rhai::Map>)>>> {
     try_stream! {
-        let (mut log_pos, mut filename) = setup_state(&args.state, args.server_id)?;
         dbg!(&log_pos, &filename);
 
         let re = Regex::new(&args.regex)?;
 
-        let mut mysql = Conn::new(Opts::from_url(&args.source)?).await?;
+        let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
 
         let mut binlog_stream = mysql.get_binlog_stream(BinlogStreamRequest::new(args.server_id)
             .with_pos(log_pos as u64)
@@ -170,41 +161,6 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::M
                             continue;
                         }
 
-                        // @TODO yield backfill
-                        let mut mysql2 = Conn::new(Opts::from_url(&args.source)?).await?;
-                        loop {
-                            let page: Vec<RawRow> = //mysql2.query(
-                                format!("select * from {}.{} where {} > 1 limit {}", db, table, "id", 1000)
-                                .fetch(mysql2)
-                            .await?;
-
-                            dbg!(&page);
-                            yield Change {
-                                db: db.to_string(),
-                                table: table.to_string(),
-                                op: ChangeType::Backfill,
-                                log_pos: log_pos as u32,
-                                filename: filename.clone(),
-                                ts: 1, // @TODO
-                                rows: page.iter()
-                                    .map(|row| {
-                                        (
-                                            None,
-                                            Some(row_to_map(row.0.clone())),
-                                        )
-                                    })
-                                .collect(),
-                            };
-                            break;
-                        }
-
-                        let change_type = match rows_event {
-                            RowsEventData::WriteRowsEvent(_) => ChangeType::Insert,
-                            RowsEventData::UpdateRowsEvent(_) => ChangeType::Update,
-                            RowsEventData::DeleteRowsEvent(_) => ChangeType::Delete,
-                            _ => ChangeType::Other,
-                        };
-
                         match rows_event {
                             RowsEventData::WriteRowsEvent(_) |
                             RowsEventData::UpdateRowsEvent(_) |
@@ -217,7 +173,12 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::M
                                 yield Change {
                                     db: db.to_string(),
                                     table: table.to_string(),
-                                    op: change_type.clone(),
+                                    op: match rows_event {
+                                        RowsEventData::WriteRowsEvent(_) => ChangeType::Insert,
+                                        RowsEventData::UpdateRowsEvent(_) => ChangeType::Update,
+                                        RowsEventData::DeleteRowsEvent(_) => ChangeType::Delete,
+                                        _ => unreachable!(),
+                                    },
                                     log_pos: log_pos as u32,
                                     filename: filename.clone(),
                                     ts: event.header().timestamp(),
@@ -233,12 +194,94 @@ fn mysql_changes(args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::M
                                         })
                                     .collect(),
                                 };
+
+                                let filename = filename.clone();
+                                sqlite.call(move |connection| {
+                                    // let tx = Transaction::new(connection, TransactionBehavior::Immediate)?;
+                                    connection.execute("
+                                        insert into log_pos (server_id, pos, filename) values (?1, max(4, ?2), ?3)
+                                        on conflict do update set
+                                        pos = excluded.pos,
+                                        filename = excluded.filename;
+                                    ", params![
+                                        args.server_id as i64,
+                                        log_pos as i64,
+                                        filename
+                                    ])
+                                    .map_err(|e| e.into())
+                                    // tx.commit().map_err(|e| e.into())
+                                }).await?;
                             },
                             _ => {}
                         }
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+}
+
+fn backfill(sqlite: Connection, args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::Map>, Option<rhai::Map>)>>> {
+    try_stream! {
+        // let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
+
+        // let pkeys: Option<(String, String, String)> = "
+        //     select table_schema, table_name, json_arrayagg(column_name)
+        //     from information_schema.columns
+        //     where column_key = 'PRI'
+        //     -- and table_schema = ?
+        //     -- and table_name = ?
+        //     group by table_schema, table_name"
+        // // .with((db.clone(), table.clone()))
+        // .first(mysql)
+        // .await?;
+
+        let rows = sqlite.call(move |sqlite| {
+            let mut stmt = sqlite.prepare("select * from backfill")?;
+            let rows = stmt.query([])?;
+            rows
+                .map(|r| Ok((r.get(0)?, r.get(1)?)))
+                .collect::<Vec<(String, String)>>()
+                .map_err(|e| e.into())
+        }).await?;
+
+        loop {
+            for (relation, pkey) in rows.clone() {
+                let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
+                let page: Vec<RawRow> = format!(
+                    "select * from {}
+                    where {}
+                    order by {} asc
+                    limit {}",
+                    // db,
+                    relation,
+                    pkey,
+                    pkey,
+                    // row.get::<&str, String>("relation").unwrap(),
+                    // row.get::<&str, String>("range").unwrap(),
+                    // row.get::<&str, String>("pkey").unwrap(),
+                    100
+                )
+                .fetch(mysql)
+                .await?;
+
+                yield Change {
+                    db: "".into(), //db.to_string(),
+                    table: relation,
+                    op: ChangeType::Backfill,
+                    log_pos: 1, //log_pos as u32,
+                    filename: "".into(), //filename.clone(),
+                    ts: 1, // @TODO
+                    rows: page.iter()
+                        .map(|row| {
+                            (
+                                None,
+                                Some(row_to_map(row.0.clone())),
+                            )
+                        })
+                    .collect(),
+                };
             }
         }
     }
@@ -290,23 +333,49 @@ impl DSL<'_> {
             )
         ).map_err(|e| dbg!(e)).unwrap()
     }
+
+    fn backfill(&mut self, db: String, table: String) -> String {
+        self.rhai.call_fn::<String>(
+            &mut self.scope,
+            &self.ast,
+            "backfill",
+            (
+                db.clone(),
+                table.clone()
+            )
+        ).map_err(|e| dbg!(e)).unwrap()
+    }
 }
 
-fn setup_state(path: &String, server_id: u32) -> Result<(i64, String), Error> {
-    let connection = sqlite::open(path)?;
+async fn setup_state(sqlite: Connection, server_id: u32) -> Result<Option<(i64, String)>, Error> {
+    sqlite.call(move |sqlite| {
+        sqlite.execute("create table if not exists log_pos (
+            server_id integer primary key,
+            pos integer not null,
+            filename text not null
+        ) strict", [])?;
 
-    connection.execute("create table if not exists log_pos (server_id integer primary key, pos integer not null, filename text not null) strict")?;
+        sqlite.execute("create table if not exists backfill (
+            relation text not null,
+            pkey text not null,
+            range text not null,
+            status text not null,
+            position blob,
+            primary key (relation, range)
+        ) strict", [])?;
 
-    let mut statement = connection.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?")?;
-    statement.bind((1, server_id as i64))?;
-    let (pos, filename) = statement.next().and_then(|s| {
-        match s {
-            sqlite::State::Row => Ok((statement.read::<i64, _>("pos").unwrap(), statement.read::<String, _>("filename").unwrap())),
-            _ => sqlite::Result::Err(sqlite::Error { code: None, message: None }),
-        }
-    }).unwrap_or((4, "".into())); // 4 means first value :shrug:
-
-    Ok((pos, filename))
+        let mut statement = sqlite.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?1")?;
+        Ok(statement.query_row([
+            &server_id
+        ], |row| {
+            Ok((row.get(0).unwrap(), row.get(1).unwrap()))
+        }).optional().map(|r| {
+            r.or_else(|| {
+                Some((4i64, "".into()))
+            })
+        }).unwrap())
+    }).await
+    .map_err(|e| e.into())
 }
 
 fn row_to_map(row: Row) -> rhai::Map {

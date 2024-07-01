@@ -37,6 +37,7 @@ fn bigquery(db, table, op, before, after, ts) {
 
 fn transform(db, table, op, before, after, ts) {
 	let res = bigquery(db, table, op, before, after, ts);
+	print(op);
 	print(res);
 	print(`${db}.${table}`);
 	res
@@ -44,4 +45,8 @@ fn transform(db, table, op, before, after, ts) {
 
 fn topic(db, table) {
 	`projects/my-project-id/topics/all_pims.${table}`
+}
+
+fn backfill(db, table) {
+	table
 }

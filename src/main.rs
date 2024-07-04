@@ -1,4 +1,9 @@
 use fallible_iterator::FallibleIterator;
+use std::time::Duration;
+use futures_util::stream::Fuse;
+use tokio::pin;
+use std::pin::Pin;
+use core::task::{Context, Poll};
 use async_stream::try_stream;
 use tokio_rusqlite::{params, Connection, Transaction, TransactionBehavior, OptionalExtension};
 use futures::pin_mut;
@@ -48,21 +53,87 @@ enum ChangeType {
     Backfill,
 }
 
+#[derive(Clone, Debug, Default)]
+struct Change {
+    op: ChangeType,
+    db: String,
+    table: String,
+    row: (Option<rhai::Map>, Option<rhai::Map>),
+    ts: u32,
+    pkey: String,
+}
+
 impl fmt::Display for ChangeType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct Change<T> {
-    log_pos: u32,
-    filename: String,
-    db: String,
-    table: String,
-    op: ChangeType,
-    rows: Vec<T>,
-    ts: u32,
+impl Change {
+    fn update_with(self, change: Change) -> Self {
+        // dbg!(&self, &change);
+        if self.db != change.db || self.table != change.table {
+            return self;
+        }
+        // change.rows.iter().for_each(|(_, new)| {
+        //     self.rows.iter_mut().filter_map(|(_, row)| {
+        //         dbg!(&row, &change);
+        match (self.row.clone(), change.row.clone()) {
+            ((_, Some(row)), (_, Some(new))) => {
+                // dbg!(&row, &new);
+                // let oldpkey = self.row.1.get(self.pkey.as_ref())?.into_string().unwrap();
+                // let newpkey = change.row.1.get(&self.pkey.into())?.into_string().unwrap();
+                let oldpkey = row.get("uuid").unwrap().to_string();
+                let newpkey = new.get("uuid").unwrap().to_string();
+                if oldpkey == newpkey {
+                    dbg!(&oldpkey, &newpkey);
+                    return change.clone();
+                }
+            }
+            _ => (),
+        };
+            // if  == 
+        //     if true {
+        //         return None;
+        //     }
+        //     Some(row)
+        //     }).collect::<Vec<_>>();
+        // });
+        self
+    }
+}
+
+struct CorrectedBackfill {
+    backfills: Pin<Box<dyn Stream<Item = Result<Change, Error>>>>,
+    changes: Pin<Box<dyn Stream<Item = Result<Change, Error>>>>,
+    // lag: Option<Result<Change, Error>>,
+}
+
+// impl CorrectedBackfill {
+//     fn new(backfill: Box<dyn Stream<Item = Change>>, changes: Box<dyn Stream<Item = Change>>) -> Self {
+//         CorrectedBackfill { backfill, changes }
+//     }
+// }
+
+impl Stream for CorrectedBackfill {
+    type Item = Result<Change, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>)
+        -> Poll<Option<Result<Change, Error>>>
+    {
+        // match self.lag.as_mut() {
+        //     Some(Ok(lag)) => return Poll::Ready(Some(Ok(lag.to_owned()))),
+        //     _ => {},
+        // }
+
+        match (self.backfills.as_mut().poll_next(cx), self.changes.as_mut().poll_next(cx)) {
+            (Poll::Ready(Some(Ok(backfill))), Poll::Ready(Some(Ok(change)))) => Poll::Ready(Some(Ok(backfill.update_with(change.to_owned())))),
+            (Poll::Pending, Poll::Ready(Some(Ok(change)))) => Poll::Ready(Some(Ok(change.to_owned()))),
+            (Poll::Ready(Some(Ok(backfill))), Poll::Pending) => Poll::Ready(Some(Ok(backfill))),
+            (Poll::Ready(None), Poll::Ready(None)) => Poll::Ready(None),
+            _ => Poll::Pending,
+        }
+    }
 }
 
 #[tokio::main]
@@ -75,8 +146,6 @@ async fn main() -> Result<()> {
 
     let sqlite = Connection::open(&args.state).await?;
 
-    let (log_pos, filename) = setup_state(sqlite.clone(), args.server_id).await?.unwrap();
-
     let mut dsl = DSL::new(args.clone().script);
 
     let pubsub = Client::new(
@@ -85,17 +154,20 @@ async fn main() -> Result<()> {
 
     let mut publishers: BTreeMap<String, Publisher> = BTreeMap::new();
 
-    let changes = mysql_changes(sqlite.clone(), log_pos, filename, args.clone());
-    pin_mut!(changes); // needed for iteration
+    let changes = mysql_changes(sqlite.clone(), args.clone());
+    // pin_mut!(changes); // needed for iteration
 
-    let backfill = backfill(sqlite.clone(), args.clone());
-    pin_mut!(backfill); // needed for iteration
+    let backfills = backfill(sqlite.clone(), args.clone());
+    // pin_mut!(backfills); // needed for iteration
 
-    let mut both = changes.merge(backfill);
-
+    // let mut both = changes.merge(backfills);
+    let mut both = CorrectedBackfill { backfills: Box::pin(backfills), changes: Box::pin(changes), };
+    // .chunks_timeout(3, Duration::from_secs(2))
+    // pin_mut!(both); // needed for iteration
     while let Some(change) = both.next().await {
-        let Change {log_pos, filename, db, table, op, rows, ts} = change?;
-        let msgs: Vec<PubsubMessage> = rows.iter().map(|(before, after)| {
+        let Change {db, table, op, row: (before, after), ts, pkey: _} = change?;
+
+        // let msgs: Vec<PubsubMessage> = rows.iter().map(|(before, after)| {
 
             let data = dsl.transform(
                 db.clone(),
@@ -105,11 +177,11 @@ async fn main() -> Result<()> {
                 after.clone(),
                 ts
             );
-            PubsubMessage {
-                data: data.to_string().into(),
-                ..Default::default()
-            }
-        }).collect();
+            // PubsubMessage {
+            //     data: data.to_string().into(),
+            //     ..Default::default()
+            // }
+        // }).collect();
 
         let topic = dsl.topic(db.clone(), table.clone());
 
@@ -133,8 +205,10 @@ impl FromRow for RawRow {
     }
 }
 
-fn mysql_changes(sqlite: Connection, mut log_pos: i64, mut filename: String, args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::Map>, Option<rhai::Map>)>>> {
+fn mysql_changes(sqlite: Connection, args: Args) -> impl Stream<Item = Result<Change>> {
     try_stream! {
+        let (mut log_pos, mut filename) = setup_state(sqlite.clone(), args.server_id).await?.unwrap();
+
         dbg!(&log_pos, &filename);
 
         let re = Regex::new(&args.regex)?;
@@ -142,6 +216,7 @@ fn mysql_changes(sqlite: Connection, mut log_pos: i64, mut filename: String, arg
         let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
 
         let mut binlog_stream = mysql.get_binlog_stream(BinlogStreamRequest::new(args.server_id)
+            .with_gtid()
             .with_pos(log_pos as u64)
             .with_filename(filename.as_bytes())
         ).await?;
@@ -170,7 +245,10 @@ fn mysql_changes(sqlite: Connection, mut log_pos: i64, mut filename: String, arg
                                     log_pos = new_pos as i64;
                                 }
 
+
+                                for row in rows_event.clone().rows(tme) {
                                 yield Change {
+                                    pkey: "".into(),
                                     db: db.to_string(),
                                     table: table.to_string(),
                                     op: match rows_event {
@@ -179,21 +257,20 @@ fn mysql_changes(sqlite: Connection, mut log_pos: i64, mut filename: String, arg
                                         RowsEventData::DeleteRowsEvent(_) => ChangeType::Delete,
                                         _ => unreachable!(),
                                     },
-                                    log_pos: log_pos as u32,
-                                    filename: filename.clone(),
                                     ts: event.header().timestamp(),
-                                    rows: rows_event.clone().rows(tme)
-                                        .map(|row| {
-                                            match row {
+                                    // rows: rows_event.clone().rows(tme)
+                                    //     .map(|row| {
+                                    row: match row {
                                                 Ok((before, after)) => (
                                                     before.map(Row::try_from).map(Result::unwrap).map(row_to_map),
                                                     after.map(Row::try_from).map(Result::unwrap).map(row_to_map),
                                                 ),
                                                 _ => panic!("{:?}", row),
                                             }
-                                        })
-                                    .collect(),
+                                        // })
+                                    // .collect(),
                                 };
+                                }
 
                                 let filename = filename.clone();
                                 sqlite.call(move |connection| {
@@ -222,67 +299,84 @@ fn mysql_changes(sqlite: Connection, mut log_pos: i64, mut filename: String, arg
     }
 }
 
-fn backfill(sqlite: Connection, args: Args) -> impl Stream<Item = Result<Change<(Option<rhai::Map>, Option<rhai::Map>)>>> {
+fn backfill(sqlite: Connection, args: Args) -> impl Stream<Item = Result<Change>> {
     try_stream! {
-        // let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
-
-        // let pkeys: Option<(String, String, String)> = "
-        //     select table_schema, table_name, json_arrayagg(column_name)
-        //     from information_schema.columns
-        //     where column_key = 'PRI'
-        //     -- and table_schema = ?
-        //     -- and table_name = ?
-        //     group by table_schema, table_name"
-        // // .with((db.clone(), table.clone()))
-        // .first(mysql)
-        // .await?;
-
-        let rows = sqlite.call(move |sqlite| {
-            let mut stmt = sqlite.prepare("select * from backfill")?;
-            let rows = stmt.query([])?;
-            rows
-                .map(|r| Ok((r.get(0)?, r.get(1)?)))
-                .collect::<Vec<(String, String)>>()
-                .map_err(|e| e.into())
-        }).await?;
-
         loop {
-            for (relation, pkey) in rows.clone() {
-                let mysql = Conn::new(Opts::from_url(&args.source)?).await?;
-                let page: Vec<RawRow> = format!(
-                    "select * from {}
-                    where {}
-                    order by {} asc
-                    limit {}",
-                    // db,
-                    relation,
-                    pkey,
-                    pkey,
-                    // row.get::<&str, String>("relation").unwrap(),
-                    // row.get::<&str, String>("range").unwrap(),
-                    // row.get::<&str, String>("pkey").unwrap(),
-                    100
-                )
-                .fetch(mysql)
-                .await?;
+            let rows = sqlite.call(move |sqlite| {
+                let mut stmt = sqlite.prepare("select db, relation, range, pkey from backfill where status = ?1")?;
+                let rows = stmt.query([
+                    "todo"
+                ])?;
+                rows
+                    .map(|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                    .collect::<Vec<(String, String, String, String)>>()
+                    .map_err(|e| e.into())
+            }).await?;
 
-                yield Change {
-                    db: "".into(), //db.to_string(),
-                    table: relation,
-                    op: ChangeType::Backfill,
-                    log_pos: 1, //log_pos as u32,
-                    filename: "".into(), //filename.clone(),
-                    ts: 1, // @TODO
-                    rows: page.iter()
-                        .map(|row| {
-                            (
-                                None,
-                                Some(row_to_map(row.0.clone())),
-                            )
-                        })
-                    .collect(),
-                };
+            let mut filter: String  = "true".to_owned();
+            for (db, relation, range, pkey) in rows.clone() {
+                loop {
+                    let mysql = Conn::new(Opts::from_url(&args.source)?).await?; // @TODO reuse shared?
+                    let page: Vec<RawRow> = format!(
+                        "select * from {}.{}
+                        where {}
+                        order by {} asc
+                        limit {}",
+                        db.clone(),
+                        relation.clone(),
+                        filter,
+                        pkey,
+                        1000
+                    )
+                    .fetch(mysql).await?;
+
+                    if let Some(RawRow(row)) = page.last() {
+                        let last: Option<String> = row.get(pkey.as_ref());
+                        filter = format!(
+                            "{} < {}",
+                            pkey,
+                            last.unwrap()
+                        );
+                    }
+                    else {
+                        sqlite.call(move |connection| {
+                            // let tx = Transaction::new(connection, TransactionBehavior::Immediate)?;
+                            connection.execute("
+                                update backfill
+                                set status = ?1
+                                where (db, relation) = (?2, ?3)
+                            ", params![
+                                "done",
+                                db.clone(),
+                                relation.clone()
+                            ])
+                            .map_err(|e| e.into())
+                            // tx.commit().map_err(|e| e.into())
+                        }).await?;
+
+                        break;
+                    }
+
+                    for row in page.iter() {
+                        yield Change {
+                            pkey: pkey.clone(),
+                            db: db.clone(),
+                            table: relation.clone(),
+                            op: ChangeType::Backfill,
+                            ts: 1, // @TODO
+                            // rows: page.iter().map(|row| {
+                            row:
+                                (
+                                    None,
+                                    Some(row_to_map(row.0.clone())),
+                                )
+                            // })
+                            // .collect(),
+                        };
+                    }
+                }
             }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     }
 }
@@ -356,12 +450,13 @@ async fn setup_state(sqlite: Connection, server_id: u32) -> Result<Option<(i64, 
         ) strict", [])?;
 
         sqlite.execute("create table if not exists backfill (
+            db text not null,
             relation text not null,
             pkey text not null,
             range text not null,
-            status text not null,
+            status text,
             position blob,
-            primary key (relation, range)
+            primary key (db, relation, range)
         ) strict", [])?;
 
         let mut statement = sqlite.prepare("select max(4, pos) pos, filename from log_pos where server_id = ?1")?;

@@ -38,7 +38,7 @@ fn bigquery(db, table, op, before, after, ts) {
 fn transform(db, table, op, before, after, ts) {
 	let res = bigquery(db, table, op, before, after, ts);
 	print(op);
-	print(res);
+	print(res.id);
 	print(`${db}.${table}`);
 	res
 }

@@ -55,11 +55,17 @@
                 rustc
                 rustfmt
                 clippy
-                openssl.dev
-                pkg-config
                 rust-analyzer-unwrapped
                 k3s
                 kubectl
+                openssl
+                sqlite
+                pkg-config
+              ];
+              buildInputs = with pkgs; [
+                sqlite
+                sqlite.dev
+                pkg-config
               ];
             };
           };
@@ -69,17 +75,23 @@
 
             cdc-rs = cdc-rs.rootCrate.build;
 
-            # cdc-rs-bis = pkgs.rustPlatform.buildRustPackage {
-            #   pname = "cdc-rs";
-            #   version = "0.1.0";
-            #   src = ./.;
-            #   cargoLock.lockFile = ./Cargo.lock;
+            cdc-rs-bis = pkgs.rustPlatform.buildRustPackage {
+              pname = "cdc-rs";
+              version = "0.1.0";
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
 
-            #   nativeBuildInputs = with pkgs; [
-            #     openssl.dev
-            #     pkg-config
-            #   ];
-            # };
+              nativeBuildInputs = with pkgs; [
+                openssl
+                sqlite
+                pkg-config
+              ];
+              buildInputs = with pkgs; [
+                openssl
+                sqlite
+                pkg-config
+              ];
+            };
 
             oci-image = nix2c.buildImage {
               name = "docteurklein/cdc-rs";

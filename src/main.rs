@@ -78,13 +78,13 @@ impl Change {
         // change.rows.iter().for_each(|(_, new)| {
         //     self.rows.iter_mut().filter_map(|(_, row)| {
         //         dbg!(&row, &change);
-        match (self.row.clone(), change.row.clone()) {
+        match (&self.row, &change.row) {
             ((_, Some(row)), (_, Some(new))) => {
-                let oldpkey = row.get::<str>(self.pkey.as_ref()).unwrap().to_string();
+                let rowpkey = row.get::<str>(self.pkey.as_ref()).unwrap().to_string();
                 let newpkey = new.get::<str>(self.pkey.as_ref()).unwrap().to_string();
-                    // dbg!(&oldpkey, &newpkey);
-                if oldpkey == newpkey {
-                    return change.clone();
+                dbg!((&rowpkey, &newpkey, rowpkey == newpkey));
+                if rowpkey == newpkey {
+                    return change;
                 }
             }
             _ => (),
@@ -259,12 +259,12 @@ fn mysql_changes(sqlite: Connection, args: Args) -> impl Stream<Item = Result<Ch
                                         // rows: rows_event.clone().rows(tme)
                                         //     .map(|row| {
                                         row: match row {
-                                                    Ok((before, after)) => (
-                                                        before.map(Row::try_from).map(Result::unwrap).map(row_to_map),
-                                                        after.map(Row::try_from).map(Result::unwrap).map(row_to_map),
-                                                    ),
-                                                    _ => panic!("{:?}", row),
-                                                }
+                                            Ok((before, after)) => (
+                                                before.map(Row::try_from).map(Result::unwrap).map(row_to_map),
+                                                after.map(Row::try_from).map(Result::unwrap).map(row_to_map),
+                                            ),
+                                            _ => panic!("{:?}", row),
+                                        }
                                             // })
                                         // .collect(),
                                     };
@@ -311,7 +311,7 @@ fn backfill(sqlite: Connection, args: Args) -> impl Stream<Item = Result<Change>
                     .map_err(|e| e.into())
             }).await?;
 
-            for (db, relation, selection, range, pkey) in rows.clone() {
+            for (db, relation, selection, range, pkey) in rows {
                 let mut filter: String  = "true or ?".to_owned();
                 let mut params = vec![Value::NULL];
                 loop {
@@ -334,13 +334,12 @@ fn backfill(sqlite: Connection, args: Args) -> impl Stream<Item = Result<Change>
                     if let Some(RawRow(row)) = page.last() {
                         let last: Option<String> = row.get(pkey.as_ref());
                         filter = format!(
-                            "{} < ?",
+                            "{} > ?",
                             pkey,
                         );
                         params = vec![
                             last.unwrap().into(),
                         ];
-                        dbg!(&query.clone(), &last.clone());
                     }
                     else {
                         sqlite.call(move |connection| {

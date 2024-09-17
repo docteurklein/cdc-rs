@@ -35,8 +35,9 @@ kubectl apply -f $(nix build --no-link --print-out-paths .#kube)
 
 ## example usage
 
-		# sqlite state
-		insert into backfill (db, relation, pkey, range, status) values ('akeneo_pim', 'pim_catalog_product', 'id', 'true', 'todo');
+```sql
+insert into backfill (db, relation, pkey, range, status) values ('akeneo_pim', 'pim_catalog_product', 'id', 'true', 'todo');
+```
 
 ```sh
 export SOURCE="mysql://replica:$PASSWORD@127.0.0.1:3306"
